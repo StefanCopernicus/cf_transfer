@@ -14,9 +14,14 @@ class TestR2KeyMapping(unittest.TestCase):
             ("acp_full", "web", True),
             ("acp", "legacy", True),
         ]
+        self.host_to_r2_prefix = {
+            "acp.copernicus.org": "articles",
+            "atmospheric-chemistry-and-physics.net": "web",
+            "atmos-chem-phys.net": "legacy",
+        }
 
     @staticmethod
-    def _simulate_url_path_to_r2_key(folder_map, pathname):
+    def _simulate_url_path_to_r2_key(folder_map, pathname, hostname=None, host_to_r2_prefix=None):
         root_prefix = next(r2 for local, r2, _ in folder_map if local.endswith(".copernicus.org"))
         mapping = {"": root_prefix}
         for local, r2, _ in folder_map:
@@ -31,7 +36,8 @@ class TestR2KeyMapping(unittest.TestCase):
                 key = bare
                 break
         else:
-            key = f"{mapping['']}/{bare}" if mapping.get("") else bare
+            r2_prefix = (host_to_r2_prefix or {}).get(hostname) or mapping.get("") or ""
+            key = f"{r2_prefix}/{bare}" if r2_prefix else bare
 
         if key.endswith("/") or key == "":
             key = key + "index.html"
@@ -51,6 +57,18 @@ class TestR2KeyMapping(unittest.TestCase):
         }
         for path, key in expected.items():
             self.assertEqual(self._simulate_url_path_to_r2_key(self.folder_map, path), key)
+        self.assertEqual(
+            self._simulate_url_path_to_r2_key(
+                self.folder_map, "/", "atmos-chem-phys.net", self.host_to_r2_prefix
+            ),
+            "legacy/index.html",
+        )
+        self.assertEqual(
+            self._simulate_url_path_to_r2_key(
+                self.folder_map, "/foo/", "atmospheric-chemistry-and-physics.net", self.host_to_r2_prefix
+            ),
+            "web/foo/index.html",
+        )
 
 
 class TestSSICacheKey(unittest.TestCase):
@@ -68,6 +86,63 @@ class TestSSICacheKey(unittest.TestCase):
         self.assertIn("const cacheKey = r2prefix + ':' + virtualPath;", js)
         self.assertIn("FRAGMENT_CACHE.get(cacheKey)", js)
         self.assertIn("FRAGMENT_CACHE.set(cacheKey", js)
+        self.assertIn("const HOST_TO_R2_PREFIX =", js)
+        self.assertIn("urlPathToR2Key(pathname, url.hostname)", js)
+        self.assertIn("HOST_TO_R2_PREFIX[hostname] ?? keyToR2Prefix(key)", js)
+
+
+class TestZoneIdCollection(unittest.TestCase):
+    def test_legacy_cf_zone_id_falls_back_to_articles_only(self):
+        calls = []
+
+        def fake_prompt(name, description, secret=False, required=True):
+            calls.append((name, description))
+            return {
+                "CF_ZONE_ID_ARTICLES": "",
+                "CF_ZONE_ID_WEB": "",
+                "CF_ZONE_ID_LEGACY": "",
+                "CF_ZONE_ID": "legacy-zone",
+            }.get(name, "")
+
+        folder_map = [
+            ("acp.copernicus.org", "articles", True),
+            ("acp_full", "web", True),
+            ("acp", "legacy", True),
+        ]
+        prefix_origin = {
+            "articles": "https://acp.copernicus.org",
+            "web": "https://atmospheric-chemistry-and-physics.net",
+            "legacy": "https://atmos-chem-phys.net",
+        }
+
+        with mock.patch.object(cf_transfer, "_prompt_credential", side_effect=fake_prompt):
+            zone_ids = cf_transfer.get_cf_zone_ids(folder_map, prefix_origin)
+
+        self.assertEqual(zone_ids, {"articles": "legacy-zone"})
+        self.assertTrue(any(
+            desc.startswith("Zone ID for atmos-chem-phys.net (legacy/)\n")
+            for _, desc in calls
+        ))
+
+
+class TestDeployScriptGeneration(unittest.TestCase):
+    def test_deploy_script_supports_multiple_zone_env_vars(self):
+        script = cf_transfer.generate_deploy_sh(
+            "acp",
+            "acp.copernicus.org",
+            "bucket-acp",
+            {
+                "articles": "https://acp.copernicus.org",
+                "web": "https://atmospheric-chemistry-and-physics.net",
+                "legacy": "https://atmos-chem-phys.net",
+            },
+        )
+        self.assertIn('CF_ZONE_ID_ARTICLES:?not set', script)
+        self.assertIn('CF_ZONE_ID_ARTICLES="${CF_ZONE_ID_ARTICLES:-${CF_ZONE_ID:-}}"', script)
+        self.assertIn('CF_ZONE_ID_WEB:-', script)
+        self.assertIn('CF_ZONE_ID_LEGACY:-', script)
+        self.assertIn('Setting route ${DOMAIN}/*', script)
+        self.assertIn('TOTAL_STEPS=$((3 + ROUTE_COUNT))', script)
 
 
 class TestRedirectGrouping(unittest.TestCase):
@@ -146,7 +221,9 @@ class TestDeployFailureHandling(unittest.TestCase):
 
             cp = cf_transfer.subprocess.CompletedProcess(args=["wrangler"], returncode=0, stdout="", stderr="")
 
-            with mock.patch.object(cf_transfer, "get_cf_env", return_value=("a" * 32, "token" * 8, None)), \
+            with mock.patch.object(cf_transfer, "get_cf_account", return_value=("a" * 32, "token" * 8)), \
+                 mock.patch.object(cf_transfer, "get_cf_zone_ids", return_value={}), \
+                 mock.patch.object(cf_transfer, "infer_prefix_origin", return_value={"articles": "https://acp.copernicus.org"}), \
                  mock.patch.object(cf_transfer, "get_output_dir", return_value=out), \
                  mock.patch.object(cf_transfer, "check_wrangler", return_value=True), \
                  mock.patch.object(cf_transfer, "wrangler_ok", side_effect=[True, False]), \
@@ -157,6 +234,48 @@ class TestDeployFailureHandling(unittest.TestCase):
 
             self.assertFalse(ok)
             self.assertFalse((out / ".deploy_done").exists())
+
+    def test_multiple_routes_use_per_prefix_zone_ids(self):
+        with tempfile.TemporaryDirectory() as td:
+            out = Path(td)
+            (out / "index.js").write_text("export default {}")
+            (out / "symlinks.json").write_text("{}")
+
+            cp = cf_transfer.subprocess.CompletedProcess(args=["wrangler"], returncode=0, stdout="", stderr="")
+            cf_api_calls = []
+
+            def fake_cf_api(method, path, token, **kwargs):
+                cf_api_calls.append((method, path, kwargs.get("json")))
+                if method == "GET":
+                    return {"success": True, "result": []}
+                return {"success": True, "result": {}}
+
+            with mock.patch.object(cf_transfer, "get_cf_account", return_value=("a" * 32, "token" * 8)), \
+                 mock.patch.object(cf_transfer, "get_cf_zone_ids", return_value={"articles": "zone-a", "web": "zone-w"}), \
+                 mock.patch.object(cf_transfer, "infer_prefix_origin", return_value={
+                     "articles": "https://acp.copernicus.org",
+                     "web": "https://atmospheric-chemistry-and-physics.net",
+                 }), \
+                 mock.patch.object(cf_transfer, "get_output_dir", return_value=out), \
+                 mock.patch.object(cf_transfer, "check_wrangler", return_value=True), \
+                 mock.patch.object(cf_transfer, "wrangler_ok", return_value=True), \
+                 mock.patch.object(cf_transfer, "parse_workers_dev_url", return_value="https://acp-worker.example.workers.dev"), \
+                 mock.patch.object(cf_transfer, "cf_api", side_effect=fake_cf_api), \
+                 mock.patch.object(cf_transfer.subprocess, "run", side_effect=[cp, cp]), \
+                 mock.patch("builtins.input", return_value=""), \
+                 mock.patch("requests.get") as mock_get:
+                mock_get.return_value.status_code = 200
+                ok = cf_transfer.run_deploy(cf_transfer.JournalAnalysis(shortcut="acp"))
+
+            self.assertTrue(ok)
+            post_payloads = [payload for method, path, payload in cf_api_calls if method == "POST"]
+            self.assertEqual(
+                post_payloads,
+                [
+                    {"pattern": "acp.copernicus.org/*", "script": "acp-worker"},
+                    {"pattern": "atmospheric-chemistry-and-physics.net/*", "script": "acp-worker"},
+                ],
+            )
 
 
 class TestVerifyHeaders(unittest.TestCase):
@@ -173,6 +292,7 @@ class TestVerifyHeaders(unittest.TestCase):
 
             with mock.patch.object(cf_transfer, "get_output_dir", return_value=out), \
                  mock.patch.object(cf_transfer, "get_cf_env", return_value=("a" * 32, "token" * 8, "zone")), \
+                 mock.patch.object(cf_transfer, "infer_prefix_origin", return_value={"articles": "https://acp.copernicus.org"}), \
                  mock.patch.object(cf_transfer, "synthesise_test_paths", return_value=["/r2", "/fb", "/bad"]), \
                  mock.patch.object(cf_transfer, "http_head", side_effect=head_calls), \
                  mock.patch("builtins.input", return_value=""):
@@ -183,6 +303,32 @@ class TestVerifyHeaders(unittest.TestCase):
             self.assertIn("R2 hit", report[0]["note"])
             self.assertIn("origin fallback", report[1]["note"])
             self.assertIn("expected 301", report[2]["note"])
+
+    def test_verify_adds_domain_notes_for_additional_origins(self):
+        with tempfile.TemporaryDirectory() as td:
+            out = Path(td)
+            analysis = cf_transfer.JournalAnalysis(shortcut="acp")
+
+            head_calls = [
+                (200, None, {}), (200, None, {"X-R2-Hit": "1"}),
+                (200, None, {}), (200, None, {}),
+                (200, None, {}), (200, None, {}),
+            ]
+
+            with mock.patch.object(cf_transfer, "get_output_dir", return_value=out), \
+                 mock.patch.object(cf_transfer, "get_cf_env", return_value=("a" * 32, "token" * 8, "zone")), \
+                 mock.patch.object(cf_transfer, "infer_prefix_origin", return_value={
+                     "articles": "https://acp.copernicus.org",
+                     "legacy": "https://atmos-chem-phys.net",
+                 }), \
+                 mock.patch.object(cf_transfer, "synthesise_test_paths", return_value=["/primary"]), \
+                 mock.patch.object(cf_transfer, "http_head", side_effect=head_calls), \
+                 mock.patch("builtins.input", return_value=""):
+                ok = cf_transfer.run_verify(analysis)
+
+            self.assertTrue(ok)
+            report = json.loads((out / "verify_report.json").read_text())
+            self.assertTrue(any("domain=atmos-chem-phys.net" in row["note"] for row in report))
 
 
 class TestSynthesisePaths(unittest.TestCase):

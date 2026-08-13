@@ -15,9 +15,13 @@ Usage:
   python3 cf_transfer.py acp               (interactive menu)
 
 Environment variables required for --deploy / --setup / --sync:
-  CF_ACCOUNT_ID   your Cloudflare account ID
-  CF_API_TOKEN    API token with Workers:Edit + R2:Edit permissions
-  CF_ZONE_ID      zone ID for your domain
+  CF_ACCOUNT_ID               your Cloudflare account ID
+  CF_API_TOKEN                API token with Workers:Edit + R2:Edit permissions
+  CF_ZONE_ID_ARTICLES         zone ID for {sc}.copernicus.org
+  CF_ZONE_ID_WEB              zone ID for the web/vhost domain
+  CF_ZONE_ID_LEGACY           zone ID for the legacy/vhost domain
+  CF_ZONE_ID_LEGACY_DISCUSS   zone ID for the optional legacy discuss domain
+  CF_ZONE_ID                  backward-compatible fallback for articles only
 """
 
 import sys
@@ -641,6 +645,45 @@ def build_symlink_map(
     return mapping, cross_redirects, prefix_origin
 
 
+def infer_prefix_origin(
+    analysis: JournalAnalysis,
+    folder_map: list[tuple[str, str, bool]],
+) -> dict[str, str]:
+    """Infer prefix → origin base URL for all active prefixes."""
+    _, _, prefix_origin = build_symlink_map([], folder_map, vhosts=analysis.vhosts)
+    for local_name, r2_prefix, _ in folder_map:
+        if r2_prefix not in prefix_origin:
+            if "." in local_name:
+                prefix_origin[r2_prefix] = f"https://{local_name}"
+            else:
+                prefix_origin[r2_prefix] = f"https://{analysis.shortcut}.copernicus.org"
+    return prefix_origin
+
+
+def collect_host_to_r2_prefix(
+    analysis: JournalAnalysis,
+    folder_map: list[tuple[str, str, bool]],
+    prefix_origin: dict[str, str],
+) -> dict[str, str]:
+    """Collect all known hostnames per R2 prefix, including vhost aliases."""
+    host_to_r2_prefix: dict[str, str] = {}
+    for r2_prefix, origin_url in prefix_origin.items():
+        host = urlparse(origin_url).hostname
+        if host:
+            host_to_r2_prefix[host] = r2_prefix
+
+    for vh in analysis.vhosts:
+        if not (vh.exists and vh.document_root and vh.server_names):
+            continue
+        vp = get_r2_prefix_for_path(Path(vh.document_root) / "_dummy", folder_map)
+        if not vp:
+            continue
+        for server_name in vh.server_names:
+            host_to_r2_prefix[server_name] = vp
+
+    return host_to_r2_prefix
+
+
 def _local_name_for_prefix(r2_prefix: str,
                             folder_map: list[tuple[str, str, bool]]) -> str:
     """Return the local folder name for a given R2 prefix."""
@@ -718,6 +761,7 @@ def generate_index_js(
     origin_map:     dict[str, str],
     folder_map:     list[tuple[str, str, bool]],
     unmigrated_rewrites: list[str] | None = None,
+    host_to_r2_prefix: dict[str, str] | None = None,
 ) -> str:
     sc = shortcut.upper()
     root_r2_prefix = next(
@@ -761,6 +805,17 @@ def generate_index_js(
         next(iter(origin_map.values()), f"https://{shortcut}.copernicus.org")
     )
     fallback_origin = _fallback_url.rstrip("/")
+    if host_to_r2_prefix is None:
+        host_to_r2_prefix = {
+            host: r2_prefix
+            for r2_prefix, origin_url in origin_map.items()
+            for host in [urlparse(origin_url).hostname]
+            if host
+        }
+    host_to_r2_prefix_js = ", ".join(
+        f"'{host}': '{r2_prefix}'"
+        for host, r2_prefix in sorted(host_to_r2_prefix.items())
+    )
 
     # Build PATH_TO_R2_PREFIX JS literal: { '': 'articles', 'supplements': 'supplements', ... }
     path_to_r2_prefix_js = ", ".join(
@@ -811,9 +866,10 @@ const SYMLINK_MAP_DEFAULT = {symlink_map_json};
 
 // Maps URL path prefix → R2 bucket prefix (generated from folder_map)
 const PATH_TO_R2_PREFIX = {{{path_to_r2_prefix_js}}};
+const HOST_TO_R2_PREFIX = {{{host_to_r2_prefix_js}}};
 const NON_ROOT_PREFIXES = Object.keys(PATH_TO_R2_PREFIX).filter(p => p !== '');
 
-function urlPathToR2Key(pathname) {{
+function urlPathToR2Key(pathname, hostname) {{
   let bare = pathname.slice(1);
   for (const [urlPrefix] of Object.entries(PATH_TO_R2_PREFIX)) {{
     if (urlPrefix === '') continue;
@@ -821,8 +877,8 @@ function urlPathToR2Key(pathname) {{
       return bare;
     }}
   }}
-  const rootPrefix = PATH_TO_R2_PREFIX[''] || '';
-  if (rootPrefix) bare = rootPrefix + '/' + bare;
+  const r2Prefix = (hostname && HOST_TO_R2_PREFIX[hostname]) || PATH_TO_R2_PREFIX[''] || '';
+  if (r2Prefix) bare = r2Prefix + '/' + bare;
   return bare;
 }}
 
@@ -928,7 +984,7 @@ export default {{
 
     // 3. Resolve symlinks
     const symlinkMap = await getSymlinkMap(env);
-    let key = urlPathToR2Key(pathname);
+    let key = urlPathToR2Key(pathname, url.hostname);
     const symlinkTarget = symlinkMap['/' + key];
     if (symlinkTarget) key = symlinkTarget.replace(/^\/+/, '');
     key = withDirectoryIndex(key);
@@ -963,7 +1019,9 @@ export default {{
     // 6. Fallback to origin — route by R2 prefix
     const ORIGIN_MAP = {{{origin_map_js}}};
     if (STRICT_R2) return new Response('Not Found', {{ status: 404 }});
-    const _originBase = ORIGIN_MAP[keyToR2Prefix(key)] ?? '{fallback_origin}';
+    const hostname = url.hostname;
+    const _r2pfx = HOST_TO_R2_PREFIX[hostname] ?? keyToR2Prefix(key);
+    const _originBase = ORIGIN_MAP[_r2pfx] ?? '{fallback_origin}';
     const originUrl = `${{_originBase}}${{url.pathname}}${{url.search}}`;
     try {{
       const originResp = await fetch(originUrl, {{
@@ -982,8 +1040,22 @@ export default {{
 """
 
 
-def generate_deploy_sh(shortcut: str, custom_domain: str, bucket_name: str) -> str:
+def generate_deploy_sh(
+    shortcut: str,
+    custom_domain: str,
+    bucket_name: str,
+    origin_map: dict[str, str],
+) -> str:
     script_name = f"{shortcut}-worker"
+    route_specs = []
+    for r2_prefix, origin_url in origin_map.items():
+        domain = urlparse(origin_url).hostname
+        if not domain:
+            continue
+        env_name = f"CF_ZONE_ID_{r2_prefix.upper().replace('-', '_')}"
+        env_expr = f"${{{env_name}}}" if r2_prefix == "articles" else f"${{{env_name}:-}}"
+        route_specs.append(f'  "{r2_prefix}|{domain}|{env_expr}"')
+    route_specs_block = "\n".join(route_specs)
     return f"""\
 #!/usr/bin/env bash
 # deploy.sh — auto-generated by cf_transfer.py
@@ -994,45 +1066,62 @@ CUSTOM_DOMAIN="{custom_domain}"
 SCRIPT_DIR="$(cd "$(dirname "${{BASH_SOURCE[0]}}")" && pwd)"
 : "${{CF_ACCOUNT_ID:?not set}}"
 : "${{CF_API_TOKEN:?not set}}"
-: "${{CF_ZONE_ID:?not set}}"
+CF_ZONE_ID_ARTICLES="${{CF_ZONE_ID_ARTICLES:-${{CF_ZONE_ID:-}}}}"
+: "${{CF_ZONE_ID_ARTICLES:?not set}}"
 CF_API="https://api.cloudflare.com/client/v4"
 AUTH="Authorization: Bearer ${{CF_API_TOKEN}}"
+ROUTE_SPECS=(
+{route_specs_block}
+)
+ROUTE_COUNT=0
+for spec in "${{ROUTE_SPECS[@]}}"; do
+  IFS='|' read -r _prefix _domain _zone_id <<< "${{spec}}"
+  [ -n "${{_zone_id}}" ] && ROUTE_COUNT=$((ROUTE_COUNT + 1))
+done
+TOTAL_STEPS=$((3 + ROUTE_COUNT))
+STEP=1
 
-echo "==> [1/4] Uploading Worker..."
+echo "==> [${{STEP}}/${{TOTAL_STEPS}}] Uploading Worker..."
 METADATA='{{"main_module":"worker.js","bindings":[{{"type":"r2_bucket","name":"R2_BUCKET","bucket_name":"{bucket_name}"}}],"compatibility_date":"2024-01-01"}}'
-RESP=$(curl -s -X PUT "${{CF_API}}/accounts/${{CF_ACCOUNT_ID}}/workers/scripts/${{SCRIPT_NAME}}" \\
-  -H "${{AUTH}}" \\
-  -F "metadata=${{METADATA}};type=application/json" \\
+RESP=$(curl -s -X PUT "${{CF_API}}/accounts/${{CF_ACCOUNT_ID}}/workers/scripts/${{SCRIPT_NAME}}" \
+  -H "${{AUTH}}" \
+  -F "metadata=${{METADATA}};type=application/json" \
   -F "worker.js=@${{SCRIPT_DIR}}/index.js;type=application/javascript+module")
 echo "${{RESP}}" | grep -q '"success":true' || {{ echo "FAILED: ${{RESP}}"; exit 1; }}
 echo "    OK"
+STEP=$((STEP + 1))
 
-echo "==> [2/4] Setting route..."
-EXISTING_ID=$(curl -s "${{CF_API}}/zones/${{CF_ZONE_ID}}/workers/routes" -H "${{AUTH}}" | \\
-  python3 -c "import sys,json;routes=json.load(sys.stdin).get('result',[]);\\
-  [print(r['id']) for r in routes if r.get('pattern')=='{custom_domain}/*']" 2>/dev/null||true)
-if [ -n "${{EXISTING_ID}}" ]; then
-  curl -s -X PUT "${{CF_API}}/zones/${{CF_ZONE_ID}}/workers/routes/${{EXISTING_ID}}" \\
-    -H "${{AUTH}}" -H "Content-Type: application/json" \\
-    --data '{{"pattern":"{custom_domain}/*","script":"{script_name}"}}' >/dev/null
-else
-  curl -s -X POST "${{CF_API}}/zones/${{CF_ZONE_ID}}/workers/routes" \\
-    -H "${{AUTH}}" -H "Content-Type: application/json" \\
-    --data '{{"pattern":"{custom_domain}/*","script":"{script_name}"}}' >/dev/null
-fi
-echo "    OK"
+for spec in "${{ROUTE_SPECS[@]}}"; do
+  IFS='|' read -r PREFIX DOMAIN ZONE_ID <<< "${{spec}}"
+  [ -n "${{ZONE_ID}}" ] || continue
+  echo "==> [${{STEP}}/${{TOTAL_STEPS}}] Setting route ${{DOMAIN}}/*..."
+  EXISTING_ID=$(curl -s "${{CF_API}}/zones/${{ZONE_ID}}/workers/routes" -H "${{AUTH}}" | \
+    python3 -c "import sys,json;routes=json.load(sys.stdin).get('result',[]); [print(r['id']) for r in routes if r.get('pattern')=='${{DOMAIN}}/*']" 2>/dev/null||true)
+  if [ -n "${{EXISTING_ID}}" ]; then
+    curl -s -X PUT "${{CF_API}}/zones/${{ZONE_ID}}/workers/routes/${{EXISTING_ID}}" \
+      -H "${{AUTH}}" -H "Content-Type: application/json" \
+      --data '{{"pattern":"'"${{DOMAIN}}"'/*","script":"{script_name}"}}' >/dev/null
+  else
+    curl -s -X POST "${{CF_API}}/zones/${{ZONE_ID}}/workers/routes" \
+      -H "${{AUTH}}" -H "Content-Type: application/json" \
+      --data '{{"pattern":"'"${{DOMAIN}}"'/*","script":"{script_name}"}}' >/dev/null
+  fi
+  echo "    OK"
+  STEP=$((STEP + 1))
+done
 
-echo "==> [3/4] Uploading symlinks.json..."
-RESP=$(curl -s -w "\\n%{{http_code}}" -X PUT "${{CF_API}}/accounts/${{CF_ACCOUNT_ID}}/r2/buckets/${{BUCKET_NAME}}/objects/_symlinks.json" \\
-  -H "${{AUTH}}" -H "Content-Type: application/json" \\
+echo "==> [${{STEP}}/${{TOTAL_STEPS}}] Uploading symlinks.json..."
+RESP=$(curl -s -w "\n%{{http_code}}" -X PUT "${{CF_API}}/accounts/${{CF_ACCOUNT_ID}}/r2/buckets/${{BUCKET_NAME}}/objects/_symlinks.json" \
+  -H "${{AUTH}}" -H "Content-Type: application/json" \
   --data-binary "@${{SCRIPT_DIR}}/symlinks.json")
 HTTP_CODE=$(echo "$RESP" | tail -1)
 if [ "$HTTP_CODE" -lt 200 ] || [ "$HTTP_CODE" -ge 300 ]; then
   echo "FAILED (HTTP $HTTP_CODE)"; exit 1
 fi
 echo "    OK"
+STEP=$((STEP + 1))
 
-echo "==> [4/4] Smoke test..."
+echo "==> [${{STEP}}/${{TOTAL_STEPS}}] Smoke test..."
 sleep 2
 HTTP=$(curl -s -o /dev/null -w "%{{http_code}}" "https://${{CUSTOM_DOMAIN}}/" --max-time 10 || echo "000")
 echo "    HTTP ${{HTTP}}"
@@ -1040,9 +1129,21 @@ echo "✓ Done."
 """
 
 
-def generate_deploy_readme(shortcut: str, custom_domain: str, bucket_name: str) -> str:
+def generate_deploy_readme(
+    shortcut: str,
+    custom_domain: str,
+    bucket_name: str,
+    origin_map: dict[str, str],
+) -> str:
     sc         = shortcut.upper()
     output_dir = get_output_dir(shortcut)    # ← was bare OUTPUT_DIR
+    zone_lines = []
+    for r2_prefix, origin_url in origin_map.items():
+        domain = urlparse(origin_url).hostname or origin_url.removeprefix("https://")
+        env_name = f"CF_ZONE_ID_{r2_prefix.upper().replace('-', '_')}"
+        suffix = "  # required primary domain" if r2_prefix == "articles" else "  # optional"
+        zone_lines.append(f"  export {env_name}=zzz    # {domain}{suffix}")
+    zone_vars = "\n".join(zone_lines)
     return f"""\
 # {sc} Cloudflare Worker — Deployment Guide
 
@@ -1052,7 +1153,8 @@ def generate_deploy_readme(shortcut: str, custom_domain: str, bucket_name: str) 
 ## Required env vars for deploy/setup/sync:
   export CF_ACCOUNT_ID=xxx
   export CF_API_TOKEN=yyy    # Workers:Edit + R2:Edit + R2:Write
-  export CF_ZONE_ID=zzz
+{zone_vars}
+  # Backward compatibility: CF_ZONE_ID still works for articles only.
 
 ## Manual curl deploy
   bash {output_dir}/deploy.sh
@@ -1060,6 +1162,7 @@ def generate_deploy_readme(shortcut: str, custom_domain: str, bucket_name: str) 
 ## DNS at Schlund/IONOS
   {custom_domain.split('.')[0]:<20} CNAME  {shortcut}-worker.YOUR-ACCOUNT.workers.dev
 """
+
 
 # ── Step 3 orchestration ──────────────────────────────────────────────────────
 
@@ -1083,14 +1186,12 @@ def run_generate(analysis: JournalAnalysis) -> bool:
     folder_map   = get_folder_map(analysis)
     all_symlinks = collect_all_symlinks(analysis)
     symlink_map, cross_redirects, prefix_origin = build_symlink_map(all_symlinks, folder_map, vhosts=analysis.vhosts)
-    # Fill in any prefixes not covered by a vhost conf (e.g. articles/ has no separate vhost)
-    for local_name, r2_prefix, _ in folder_map:
-        if r2_prefix not in prefix_origin:
-            # Derive origin from local folder name: sd.copernicus.org → https://sd.copernicus.org
-            if "." in local_name:
-                prefix_origin[r2_prefix] = f"https://{local_name}"
-            else:
-                prefix_origin[r2_prefix] = f"https://{sc}.copernicus.org"
+    prefix_origin.update({
+        r2_prefix: origin_url
+        for r2_prefix, origin_url in infer_prefix_origin(analysis, folder_map).items()
+        if r2_prefix not in prefix_origin
+    })
+    host_to_r2_prefix = collect_host_to_r2_prefix(analysis, folder_map, prefix_origin)
 
     # Pass cross_redirects into generate_index_js alongside irregular redirects:
     numeric_groups, letter_groups, irregular = collect_all_redirects(analysis)
@@ -1107,10 +1208,11 @@ def run_generate(analysis: JournalAnalysis) -> bool:
         sc, numeric_groups, letter_groups,
         irregular_all, symlink_map, prefix_origin, folder_map,
         unmigrated_rewrites=unmigrated_rewrites,
+        host_to_r2_prefix=host_to_r2_prefix,
     )
     symlinks_json = json.dumps(symlink_map, indent=2)
-    deploy_sh     = generate_deploy_sh(sc, custom_domain, bucket_name)
-    readme        = generate_deploy_readme(sc, custom_domain, bucket_name)
+    deploy_sh     = generate_deploy_sh(sc, custom_domain, bucket_name, prefix_origin)
+    readme        = generate_deploy_readme(sc, custom_domain, bucket_name, prefix_origin)
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     (OUTPUT_DIR / "index.js"     ).write_text(index_js)
@@ -1264,6 +1366,43 @@ def get_cf_env() -> tuple[str, str, str | None] | None:
     except (KeyboardInterrupt, EOFError):
         print("\n  Cancelled."); return None
 
+
+def get_cf_zone_ids(
+    folder_map: list[tuple[str, str, bool]],
+    prefix_origin: dict[str, str],
+) -> dict[str, str]:
+    """Prompt for per-prefix zone IDs used to bind Worker routes."""
+    zone_ids: dict[str, str] = {}
+    for _, r2_prefix, _ in folder_map:
+        env_name = f"CF_ZONE_ID_{r2_prefix.upper().replace('-', '_')}"
+        domain = urlparse(prefix_origin.get(r2_prefix, "")).hostname
+        label = f"{domain} ({r2_prefix}/)" if domain else f"{r2_prefix}/"
+        zone_id = _prompt_credential(
+            env_name,
+            f"Zone ID for {label}\n"
+            "Found at: https://dash.cloudflare.com → select domain → right sidebar\n"
+            "Press Enter to skip (Worker will not serve this domain):",
+            secret=False,
+            required=False,
+        )
+        if zone_id:
+            zone_ids[r2_prefix] = zone_id
+
+    if not zone_ids:
+        legacy_zone_id = _prompt_credential(
+            "CF_ZONE_ID",
+            "Zone ID for your primary custom domain (articles, backward-compatible fallback).\n"
+            "Found at: https://dash.cloudflare.com → select domain → right sidebar\n"
+            "Press Enter to skip (Worker will be workers.dev only):",
+            secret=False,
+            required=False,
+        )
+        if legacy_zone_id:
+            zone_ids["articles"] = legacy_zone_id
+
+    return zone_ids
+
+
 def parse_workers_dev_url(wrangler_stdout: str, script_name: str) -> str | None:
     """Extract the workers.dev URL from wrangler deploy output."""
     # wrangler prints: "https://sd-worker.aged-waterfall-d369.workers.dev"
@@ -1273,32 +1412,28 @@ def parse_workers_dev_url(wrangler_stdout: str, script_name: str) -> str | None:
     return None
 
 def run_deploy(analysis: JournalAnalysis) -> bool:
-    env = get_cf_env()
+    env = get_cf_account()
     if not env:
         return False
-    account_id, api_token, zone_id = env
+    account_id, api_token = env
 
     sc          = analysis.shortcut
     OUTPUT_DIR  = get_output_dir(sc)
     script_name = f"{sc}-worker"
     bucket_name = get_bucket_name(sc)
+    folder_map  = get_folder_map(analysis)
+    prefix_origin = infer_prefix_origin(analysis, folder_map)
 
     # Pick custom_domain — prefer copernicus.org, fallback to constructed default
-    custom_domain = f"{sc}.copernicus.org"
-    for v in analysis.vhosts:
-        if v.exists and v.server_names:
-            match = next(
-                (n for n in v.server_names if "copernicus.org" in n),
-                None
-            )
-            if match:
-                custom_domain = match
-                break
+    custom_domain = urlparse(prefix_origin.get("articles", f"https://{sc}.copernicus.org")).hostname or f"{sc}.copernicus.org"
 
     # Let user confirm or override
     prompted = input(f"  Origin domain [{custom_domain}]: ").strip()
     if prompted:
         custom_domain = prompted
+        prefix_origin["articles"] = f"https://{custom_domain}"
+
+    zone_ids = get_cf_zone_ids(folder_map, prefix_origin)
 
     index_js_path      = OUTPUT_DIR / "index.js"
     symlinks_json_path = OUTPUT_DIR / "symlinks.json"
@@ -1315,7 +1450,12 @@ def run_deploy(analysis: JournalAnalysis) -> bool:
         print("ERROR: pip install requests")
         return False
 
-    STEPS = 4 if zone_id else 3
+    route_specs = []
+    for r2_prefix, zone_id in zone_ids.items():
+        domain = urlparse(prefix_origin.get(r2_prefix, "")).hostname
+        if domain:
+            route_specs.append((r2_prefix, zone_id, domain))
+    STEPS = 3 + len(route_specs)
 
     # Load cached workers.dev URL if available (set after first deploy)
     workers_dev_url_path = OUTPUT_DIR / ".workers_dev_url"
@@ -1325,8 +1465,8 @@ def run_deploy(analysis: JournalAnalysis) -> bool:
 
     print(f"\n{'═' * 70}")
     print(f"  Step 6 — Deploying  {script_name}")
-    if zone_id:
-        print(f"  Domain : {custom_domain}")
+    if route_specs:
+        print(f"  Domains: {', '.join(domain for _, _, domain in route_specs)}")
     else:
         print(f"  Domain : {workers_dev_url}/  (no Zone ID)")
     print(f"{'═' * 70}")
@@ -1367,31 +1507,33 @@ bucket_name = "{bucket_name}"
     else:
         workers_dev_url = f"https://{script_name}.YOUR-ACCOUNT.workers.dev"
 
-    # ── [2] Set route (optional) ──────────────────────────────────────────────
-    if zone_id:
-        print(f"  [2/{STEPS}] Setting route {custom_domain}/*...", end=" ", flush=True)
-        route_pattern = f"{custom_domain}/*"
-        existing      = cf_api("GET", f"/zones/{zone_id}/workers/routes", api_token)
-        existing_id   = next((r["id"] for r in existing.get("result", [])
-                               if r.get("pattern") == route_pattern), None)
-        route_payload = {"pattern": route_pattern, "script": script_name}
-        if existing_id:
-            data = cf_api("PUT", f"/zones/{zone_id}/workers/routes/{existing_id}",
-                          api_token, json=route_payload)
-        else:
-            data = cf_api("POST", f"/zones/{zone_id}/workers/routes",
-                          api_token, json=route_payload)
-        try:
-            check_response(data, "Route setup")
-        except SystemExit:
-            return False
+    # ── [2..N] Set routes (optional) ───────────────────────────────────────────
+    next_step = 2
+    if route_specs:
+        for _, zone_id, domain in route_specs:
+            print(f"  [{next_step}/{STEPS}] Setting route {domain}/*...", end=" ", flush=True)
+            route_pattern = f"{domain}/*"
+            existing      = cf_api("GET", f"/zones/{zone_id}/workers/routes", api_token)
+            existing_id   = next((r["id"] for r in existing.get("result", [])
+                                   if r.get("pattern") == route_pattern), None)
+            route_payload = {"pattern": route_pattern, "script": script_name}
+            if existing_id:
+                data = cf_api("PUT", f"/zones/{zone_id}/workers/routes/{existing_id}",
+                              api_token, json=route_payload)
+            else:
+                data = cf_api("POST", f"/zones/{zone_id}/workers/routes",
+                              api_token, json=route_payload)
+            try:
+                check_response(data, f"Route setup ({domain})")
+            except SystemExit:
+                return False
+            next_step += 1
     else:
-        print(f"  [2/{STEPS}] Route setup skipped — no Zone ID provided.")
-        print(f"             Worker available at: "
-              f"https://{script_name}.YOUR-ACCOUNT.workers.dev")
+        print("  Route setup skipped — no Zone IDs provided.")
+        print(f"  Worker available at: https://{script_name}.YOUR-ACCOUNT.workers.dev")
 
     # ── [3] Upload symlinks.json to R2 ────────────────────────────────────────
-    print(f"  [3/{STEPS}] Uploading symlinks.json to R2...", end=" ", flush=True)
+    print(f"  [{next_step}/{STEPS}] Uploading symlinks.json to R2...", end=" ", flush=True)
     cmd_prefix = ["wrangler"] if check_wrangler() else ["npx", "wrangler"]
     result = subprocess.run(
         cmd_prefix + ["r2", "object", "put",
@@ -1405,9 +1547,9 @@ bucket_name = "{bucket_name}"
         return False
 
     # ── [3/4] Smoke test ──────────────────────────────────────────────────────
-    print(f"  [{STEPS}/{STEPS}] Smoke test...", end=" ", flush=True)
-    if zone_id:
-        smoke_url = f"https://{custom_domain}/"
+    print(f"  [{next_step + 1}/{STEPS}] Smoke test...", end=" ", flush=True)
+    if route_specs:
+        smoke_url = f"https://{route_specs[0][2]}/"
     else:
         smoke_url = f"{workers_dev_url}/"
     time.sleep(2)
@@ -1418,12 +1560,12 @@ bucket_name = "{bucket_name}"
         print(f"⚠ {e}")
 
     print(f"\n  ✓ Deployed.")
-    if zone_id:
-        print(f"  URL : https://{custom_domain}/")
+    if route_specs:
+        print(f"  URL : https://{route_specs[0][2]}/")
         print(f"  Also: {workers_dev_url}/")
     else:
         print(f"  URL : {workers_dev_url}/")
-        print(f"  To bind a custom domain later, set CF_ZONE_ID and re-run Deploy.")
+        print("  To bind custom domains later, set CF_ZONE_ID_ARTICLES / CF_ZONE_ID_* and re-run Deploy.")
     print(f"{'═' * 70}\n")
 
     (OUTPUT_DIR / ".deploy_done").touch()
@@ -1508,9 +1650,11 @@ def synthesise_test_paths(analysis: JournalAnalysis) -> list[str]:
 def run_verify(analysis: JournalAnalysis) -> bool:
     sc         = analysis.shortcut
     OUTPUT_DIR = get_output_dir(sc)
+    folder_map = get_folder_map(analysis)
+    prefix_origin = infer_prefix_origin(analysis, folder_map)
 
     # Origin is always the real copernicus.org domain
-    origin_domain = f"{sc}.copernicus.org"
+    origin_domain = urlparse(prefix_origin.get("articles", f"https://{sc}.copernicus.org")).hostname or f"{sc}.copernicus.org"
 
     # Worker URL: use workers.dev if no zone ID
     env = get_cf_env()
@@ -1520,7 +1664,7 @@ def run_verify(analysis: JournalAnalysis) -> bool:
                       if workers_dev_url_path.exists() else None
 
     if zone_id:
-        worker_domain = f"{sc}.copernicus.org"
+        worker_domain = origin_domain
         worker_base   = f"https://{worker_domain}"
     elif workers_dev_url:
         worker_domain = workers_dev_url.removeprefix("https://")
@@ -1553,9 +1697,10 @@ def run_verify(analysis: JournalAnalysis) -> bool:
     results = []
     passed = failed = skipped = 0
 
-    for path in test_paths:
-        o_code, o_loc, _ = http_head(f"https://{origin_domain}{path}")
-        w_code, w_loc, w_headers = http_head(f"{worker_base}{path}")
+    def verify_path(path: str, origin_base: str, worker_base_for_path: str, domain_note: str = "") -> None:
+        nonlocal passed, failed, skipped
+        o_code, o_loc, _ = http_head(f"{origin_base}{path}")
+        w_code, w_loc, w_headers = http_head(f"{worker_base_for_path}{path}")
         is_r2_hit = (w_headers.get("X-R2-Hit") or w_headers.get("x-r2-hit")) == "1"
         is_origin_fallback = (w_headers.get("X-Origin-Fallback") or w_headers.get("x-origin-fallback")) == "1"
 
@@ -1580,6 +1725,8 @@ def run_verify(analysis: JournalAnalysis) -> bool:
                 note = (note + "; " if note else "") + "200 without R2/fallback header"
         elif w_code == 200 and not is_r2_hit and not is_origin_fallback:
             note = (note + "; " if note else "") + "mismatch without routing header"
+        if domain_note:
+            note = (note + "; " if note else "") + domain_note
 
         if match: passed += 1; flag = "✓"
         else:     failed += 1; flag = "✗"
@@ -1590,6 +1737,18 @@ def run_verify(analysis: JournalAnalysis) -> bool:
         results.append(VerifyResult(path=path, origin_code=o_code, origin_loc=o_loc,
                                     worker_code=w_code, worker_loc=w_loc,
                                     match=match, note=note))
+
+    for path in test_paths:
+        verify_path(path, f"https://{origin_domain}", worker_base)
+
+    for r2_prefix, origin_url in prefix_origin.items():
+        if r2_prefix == "articles":
+            continue
+        domain = urlparse(origin_url).hostname
+        if not domain:
+            continue
+        for path in ("/", "/index.html"):
+            verify_path(path, f"https://{domain}", worker_base, f"domain={domain}")
 
     print(f"\n  {'─'*70}")
     print(f"  {passed} passed  /  {failed} failed  /  {skipped} skipped")
@@ -2477,7 +2636,7 @@ def main() -> None:
         print(f"  --verify     verify redirects")
         print()
         print(f"  Env vars for API steps:")
-        print(f"    CF_ACCOUNT_ID  CF_API_TOKEN  CF_ZONE_ID")
+        print("    CF_ACCOUNT_ID  CF_API_TOKEN  CF_ZONE_ID_ARTICLES  [CF_ZONE_ID_*]")
         sys.exit(1)
 
     shortcut = args[0].strip().lower()
