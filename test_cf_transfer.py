@@ -89,6 +89,11 @@ class TestSSICacheKey(unittest.TestCase):
         self.assertIn("const HOST_TO_R2_PREFIX =", js)
         self.assertIn("urlPathToR2Key(pathname, url.hostname)", js)
         self.assertIn("HOST_TO_R2_PREFIX[hostname] ?? keyToR2Prefix(key)", js)
+        self.assertIn("const SYMLINK_MAP_DEFAULT = {};", js)
+        self.assertIn("const shardCache = {};", js)
+        self.assertIn("async function getSymlinkShard(env, r2prefix)", js)
+        self.assertIn("const requestPrefix = keyToR2Prefix(key);", js)
+        self.assertIn("const symlinkShard = await getSymlinkShard(env, requestPrefix);", js)
 
 
 class TestZoneIdCollection(unittest.TestCase):
@@ -142,7 +147,9 @@ class TestDeployScriptGeneration(unittest.TestCase):
         self.assertIn('CF_ZONE_ID_WEB:-', script)
         self.assertIn('CF_ZONE_ID_LEGACY:-', script)
         self.assertIn('Setting route ${DOMAIN}/*', script)
-        self.assertIn('TOTAL_STEPS=$((3 + ROUTE_COUNT))', script)
+        self.assertIn('SHARD_FILES=("${SCRIPT_DIR}/symlinks/"*.json)', script)
+        self.assertIn('TOTAL_STEPS=$((2 + ROUTE_COUNT + SYMLINK_UPLOAD_STEPS))', script)
+        self.assertIn('/objects/_symlinks/${prefix}.json', script)
 
 
 class TestRedirectGrouping(unittest.TestCase):
@@ -212,6 +219,40 @@ class TestSymlinkMap(unittest.TestCase):
             self.assertNotIn("/articles/broken.txt", mapping)
 
 
+class TestGenerateOutputs(unittest.TestCase):
+    def test_run_generate_writes_sharded_symlink_files(self):
+        with tempfile.TemporaryDirectory() as td:
+            out = Path(td)
+            analysis = cf_transfer.JournalAnalysis(shortcut="acp")
+            symlink_map = {
+                "/articles/foo.pdf": "/articles/real/foo.pdf",
+                "/legacy/bar.pdf": "/legacy/real/bar.pdf",
+            }
+
+            with mock.patch.object(cf_transfer, "get_output_dir", return_value=out), \
+                 mock.patch.object(cf_transfer, "get_folder_map", return_value=[("acp.copernicus.org", "articles", True), ("acp", "legacy", True)]), \
+                 mock.patch.object(cf_transfer, "collect_all_symlinks", return_value=[]), \
+                 mock.patch.object(cf_transfer, "build_symlink_map", return_value=(symlink_map, [], {"articles": "https://acp.copernicus.org", "legacy": "https://legacy.example"})), \
+                 mock.patch.object(cf_transfer, "infer_prefix_origin", return_value={"articles": "https://acp.copernicus.org", "legacy": "https://legacy.example"}), \
+                 mock.patch.object(cf_transfer, "collect_host_to_r2_prefix", return_value={"acp.copernicus.org": "articles"}), \
+                 mock.patch.object(cf_transfer, "collect_all_redirects", return_value=({}, {}, [])), \
+                 mock.patch.object(cf_transfer, "collect_unmigrated_rewrite_rules", return_value=[]):
+                ok = cf_transfer.run_generate(analysis)
+
+            self.assertTrue(ok)
+            self.assertEqual(json.loads((out / "symlinks.json").read_text()), symlink_map)
+            self.assertEqual(
+                json.loads((out / "symlinks" / "articles.json").read_text()),
+                {"/articles/foo.pdf": "/articles/real/foo.pdf"},
+            )
+            self.assertEqual(
+                json.loads((out / "symlinks" / "legacy.json").read_text()),
+                {"/legacy/bar.pdf": "/legacy/real/bar.pdf"},
+            )
+            generated_js = (out / "index.js").read_text()
+            self.assertIn("const SYMLINK_MAP_DEFAULT = {};", generated_js)
+
+
 class TestDeployFailureHandling(unittest.TestCase):
     def test_symlink_upload_failure_aborts_without_deploy_done(self):
         with tempfile.TemporaryDirectory() as td:
@@ -276,6 +317,41 @@ class TestDeployFailureHandling(unittest.TestCase):
                     {"pattern": "atmospheric-chemistry-and-physics.net/*", "script": "acp-worker"},
                 ],
             )
+
+    def test_run_deploy_uploads_sharded_symlink_files(self):
+        with tempfile.TemporaryDirectory() as td:
+            out = Path(td)
+            (out / "index.js").write_text("export default {}")
+            (out / "symlinks.json").write_text("{}")
+            symlink_dir = out / "symlinks"
+            symlink_dir.mkdir()
+            (symlink_dir / "articles.json").write_text("{}")
+            (symlink_dir / "legacy.json").write_text("{}")
+
+            cp = cf_transfer.subprocess.CompletedProcess(args=["wrangler"], returncode=0, stdout="", stderr="")
+            run_calls = []
+
+            def fake_run(cmd, **kwargs):
+                run_calls.append(cmd)
+                return cp
+
+            with mock.patch.object(cf_transfer, "get_cf_account", return_value=("a" * 32, "token" * 8)), \
+                 mock.patch.object(cf_transfer, "get_cf_zone_ids", return_value={}), \
+                 mock.patch.object(cf_transfer, "infer_prefix_origin", return_value={"articles": "https://acp.copernicus.org"}), \
+                 mock.patch.object(cf_transfer, "get_output_dir", return_value=out), \
+                 mock.patch.object(cf_transfer, "check_wrangler", return_value=True), \
+                 mock.patch.object(cf_transfer, "wrangler_ok", return_value=True), \
+                 mock.patch.object(cf_transfer, "parse_workers_dev_url", return_value="https://acp-worker.example.workers.dev"), \
+                 mock.patch.object(cf_transfer.subprocess, "run", side_effect=fake_run), \
+                 mock.patch("requests.get") as mock_get:
+                mock_get.return_value.status_code = 200
+                ok = cf_transfer.run_deploy(cf_transfer.JournalAnalysis(shortcut="acp"))
+
+            self.assertTrue(ok)
+            flattened = [" ".join(cmd) for cmd in run_calls]
+            self.assertTrue(any("_symlinks/articles.json" in cmd for cmd in flattened))
+            self.assertTrue(any("_symlinks/legacy.json" in cmd for cmd in flattened))
+            self.assertFalse(any("_symlinks.json" in cmd for cmd in flattened))
 
 
 class TestVerifyHeaders(unittest.TestCase):

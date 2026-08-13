@@ -773,6 +773,7 @@ def generate_index_js(
     symlink_map:    dict[str, str],
     origin_map:     dict[str, str],
     folder_map:     list[tuple[str, str, bool]],
+    symlink_shards: dict[str, dict[str, str]] | None = None,
     unmigrated_rewrites: list[str] | None = None,
     host_to_r2_prefix: dict[str, str] | None = None,
 ) -> str:
@@ -809,7 +810,6 @@ def generate_index_js(
 
     redirect_rules_block = "\n".join(redirect_rules_lines)
     irregular_block      = generate_irregular_redirect_js(irregular, root_r2_prefix=root_r2_prefix)
-    symlink_map_json     = json.dumps(symlink_map, indent=2)
 
     # Build the JS ORIGIN_MAP literal:  { 'articles': 'https://...', ... }
     origin_map_js = ", ".join(
@@ -879,7 +879,10 @@ const IRREGULAR_REDIRECTS = [
 {irregular_block}
 ];
 
-const SYMLINK_MAP_DEFAULT = {symlink_map_json};
+// Symlink map is loaded from R2 shards (_symlinks/{{prefix}}.json).
+// The embedded default is intentionally empty — large journals cannot fit
+// full symlink maps inside the Worker script size limits.
+const SYMLINK_MAP_DEFAULT = {{}};
 
 // Maps URL path prefix → R2 bucket prefix (generated from folder_map)
 const PATH_TO_R2_PREFIX = {{{path_to_r2_prefix_js}}};
@@ -911,17 +914,22 @@ function keyToR2Prefix(key) {{
   return PATH_TO_R2_PREFIX[''] || first;
 }}
 
-let symlinkCache     = null;
-let symlinkCacheTime = 0;
+const shardCache = {{}};
 const SYMLINK_CACHE_TTL = 300_000;
 
-async function getSymlinkMap(env) {{
+async function getSymlinkShard(env, r2prefix) {{
   const now = Date.now();
-  if (symlinkCache && now - symlinkCacheTime < SYMLINK_CACHE_TTL) return symlinkCache;
+  const cached = shardCache[r2prefix];
+  if (cached && now - cached.ts < SYMLINK_CACHE_TTL) return cached.map;
   try {{
-    const obj = await env.R2_BUCKET.get('_symlinks.json');
-    if (obj) {{ symlinkCache = await obj.json(); symlinkCacheTime = now; return symlinkCache; }}
+    const obj = await env.R2_BUCKET.get(`_symlinks/${{r2prefix}}.json`);
+    if (obj) {{
+      const map = await obj.json();
+      shardCache[r2prefix] = {{ map, ts: now }};
+      return map;
+    }}
   }} catch (_) {{}}
+  shardCache[r2prefix] = {{ map: SYMLINK_MAP_DEFAULT, ts: now }};
   return SYMLINK_MAP_DEFAULT;
 }}
 
@@ -1002,9 +1010,10 @@ export default {{
     }}
 
     // 3. Resolve symlinks
-    const symlinkMap = await getSymlinkMap(env);
     let key = urlPathToR2Key(pathname, url.hostname);
-    const symlinkTarget = symlinkMap['/' + key];
+    const requestPrefix = keyToR2Prefix(key);
+    const symlinkShard = await getSymlinkShard(env, requestPrefix);
+    const symlinkTarget = symlinkShard['/' + key];
     if (symlinkTarget) key = symlinkTarget.replace(/^\/+/, '');
     key = withDirectoryIndex(key);
 
@@ -1092,12 +1101,21 @@ AUTH="Authorization: Bearer ${{CF_API_TOKEN}}"
 ROUTE_SPECS=(
 {route_specs_block}
 )
+shopt -s nullglob
+SHARD_FILES=("${{SCRIPT_DIR}}/symlinks/"*.json)
+shopt -u nullglob
 ROUTE_COUNT=0
 for spec in "${{ROUTE_SPECS[@]}}"; do
   IFS='|' read -r _prefix _domain _zone_id <<< "${{spec}}"
   [ -n "${{_zone_id}}" ] && ROUTE_COUNT=$((ROUTE_COUNT + 1))
 done
-TOTAL_STEPS=$((3 + ROUTE_COUNT))
+SYMLINK_UPLOAD_STEPS=0
+if [ "${{#SHARD_FILES[@]}}" -gt 0 ]; then
+  SYMLINK_UPLOAD_STEPS=${{#SHARD_FILES[@]}}
+elif [ -f "${{SCRIPT_DIR}}/symlinks.json" ]; then
+  SYMLINK_UPLOAD_STEPS=1
+fi
+TOTAL_STEPS=$((2 + ROUTE_COUNT + SYMLINK_UPLOAD_STEPS))
 STEP=1
 
 echo "==> [${{STEP}}/${{TOTAL_STEPS}}] Uploading Worker..."
@@ -1129,16 +1147,35 @@ for spec in "${{ROUTE_SPECS[@]}}"; do
   STEP=$((STEP + 1))
 done
 
-echo "==> [${{STEP}}/${{TOTAL_STEPS}}] Uploading symlinks.json..."
-RESP=$(curl -s -w "\n%{{http_code}}" -X PUT "${{CF_API}}/accounts/${{CF_ACCOUNT_ID}}/r2/buckets/${{BUCKET_NAME}}/objects/_symlinks.json" \
-  -H "${{AUTH}}" -H "Content-Type: application/json" \
-  --data-binary "@${{SCRIPT_DIR}}/symlinks.json")
-HTTP_CODE=$(echo "$RESP" | tail -1)
-if [ "$HTTP_CODE" -lt 200 ] || [ "$HTTP_CODE" -ge 300 ]; then
-  echo "FAILED (HTTP $HTTP_CODE)"; exit 1
+if [ "${{#SHARD_FILES[@]}}" -gt 0 ]; then
+  for shard in "${{SHARD_FILES[@]}}"; do
+    prefix=$(basename "$shard" .json)
+    echo "==> [${{STEP}}/${{TOTAL_STEPS}}] Uploading symlinks/${{prefix}}.json..."
+    RESP=$(curl -s -w "\n%{{http_code}}" -X PUT \
+      "${{CF_API}}/accounts/${{CF_ACCOUNT_ID}}/r2/buckets/${{BUCKET_NAME}}/objects/_symlinks/${{prefix}}.json" \
+      -H "${{AUTH}}" -H "Content-Type: application/json" \
+      --data-binary "@${{shard}}")
+    HTTP_CODE=$(echo "$RESP" | tail -1)
+    if [ "$HTTP_CODE" -lt 200 ] || [ "$HTTP_CODE" -ge 300 ]; then
+      echo "FAILED uploading ${{prefix}} shard (HTTP $HTTP_CODE)"; exit 1
+    fi
+    echo "    OK: ${{prefix}}"
+    STEP=$((STEP + 1))
+  done
+elif [ -f "${{SCRIPT_DIR}}/symlinks.json" ]; then
+  echo "==> [${{STEP}}/${{TOTAL_STEPS}}] Uploading symlinks.json..."
+  RESP=$(curl -s -w "\n%{{http_code}}" -X PUT "${{CF_API}}/accounts/${{CF_ACCOUNT_ID}}/r2/buckets/${{BUCKET_NAME}}/objects/_symlinks.json" \
+    -H "${{AUTH}}" -H "Content-Type: application/json" \
+    --data-binary "@${{SCRIPT_DIR}}/symlinks.json")
+  HTTP_CODE=$(echo "$RESP" | tail -1)
+  if [ "$HTTP_CODE" -lt 200 ] || [ "$HTTP_CODE" -ge 300 ]; then
+    echo "FAILED (HTTP $HTTP_CODE)"; exit 1
+  fi
+  echo "    OK"
+  STEP=$((STEP + 1))
+else
+  echo "==> [${{STEP}}/${{TOTAL_STEPS}}] No symlink files found — skipping upload."
 fi
-echo "    OK"
-STEP=$((STEP + 1))
 
 echo "==> [${{STEP}}/${{TOTAL_STEPS}}] Smoke test..."
 sleep 2
@@ -1218,6 +1255,11 @@ def run_generate(analysis: JournalAnalysis) -> bool:
         if "host" not in cr:
             cr["host"] = _host_for_prefix((cr.get("scope") or "").strip("/"), prefix_origin)
     irregular_all = irregular + cross_redirects   # ← merge cross-folder redirects in
+    symlink_shards: dict[str, dict[str, str]] = defaultdict(dict)
+    for link_key, target_val in symlink_map.items():
+        parts = link_key.lstrip("/").split("/", 1)
+        shard_prefix = parts[0] if parts and parts[0] else "articles"
+        symlink_shards[shard_prefix][link_key] = target_val
 
     unmigrated_rewrites = collect_unmigrated_rewrite_rules(analysis)
     if unmigrated_rewrites:
@@ -1229,6 +1271,7 @@ def run_generate(analysis: JournalAnalysis) -> bool:
     index_js = generate_index_js(
         sc, numeric_groups, letter_groups,
         irregular_all, symlink_map, prefix_origin, folder_map,
+        symlink_shards=symlink_shards,
         unmigrated_rewrites=unmigrated_rewrites,
         host_to_r2_prefix=host_to_r2_prefix,
     )
@@ -1239,6 +1282,11 @@ def run_generate(analysis: JournalAnalysis) -> bool:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     (OUTPUT_DIR / "index.js"     ).write_text(index_js)
     (OUTPUT_DIR / "symlinks.json").write_text(symlinks_json)
+    symlinks_dir = OUTPUT_DIR / "symlinks"
+    symlinks_dir.mkdir(parents=True, exist_ok=True)
+    for shard_prefix, shard_map in sorted(symlink_shards.items()):
+        shard_path = symlinks_dir / f"{shard_prefix}.json"
+        shard_path.write_text(json.dumps(shard_map, indent=2))
     deploy_sh_path = OUTPUT_DIR / "deploy.sh"
     deploy_sh_path.write_text(deploy_sh)
     deploy_sh_path.chmod(0o755)
@@ -1254,6 +1302,9 @@ def run_generate(analysis: JournalAnalysis) -> bool:
     print(f"{'═' * 70}")
     print(f"  index.js       — Worker logic")
     print(f"  symlinks.json  — Symlink map")
+    print(f"  symlinks/      — Sharded symlink maps ({len(symlink_shards)} shards)")
+    for shard_prefix, shard_map in sorted(symlink_shards.items()):
+        print(f"    {shard_prefix}.json  ({len(shard_map)} entries)")
     print(f"  deploy.sh      — curl-only deploy script")
     print(f"  DEPLOY.md      — Deployment guide")
     print()
@@ -1453,6 +1504,7 @@ def run_deploy(analysis: JournalAnalysis) -> bool:
 
     index_js_path      = OUTPUT_DIR / "index.js"
     symlinks_json_path = OUTPUT_DIR / "symlinks.json"
+    symlinks_dir       = OUTPUT_DIR / "symlinks"
 
     if not index_js_path.exists():
         print("  ERROR: index.js not found — run Generate first (option 3).")
@@ -1471,7 +1523,10 @@ def run_deploy(analysis: JournalAnalysis) -> bool:
         domain = urlparse(prefix_origin.get(r2_prefix, "")).hostname
         if domain:
             route_specs.append((r2_prefix, zone_id, domain))
-    STEPS = 3 + len(route_specs)
+    shard_files = sorted(symlinks_dir.glob("*.json")) if symlinks_dir.exists() else []
+    has_legacy_symlink_file = symlinks_json_path.exists()
+    symlink_upload_steps = len(shard_files) if shard_files else (1 if has_legacy_symlink_file else 0)
+    STEPS = 2 + len(route_specs) + symlink_upload_steps
 
     # Load cached workers.dev URL if available (set after first deploy)
     workers_dev_url_path = OUTPUT_DIR / ".workers_dev_url"
@@ -1548,22 +1603,41 @@ bucket_name = "{bucket_name}"
         print("  Route setup skipped — no Zone IDs provided.")
         print(f"  Worker available at: https://{script_name}.YOUR-ACCOUNT.workers.dev")
 
-    # ── [3] Upload symlinks.json to R2 ────────────────────────────────────────
-    print(f"  [{next_step}/{STEPS}] Uploading symlinks.json to R2...", end=" ", flush=True)
+    # ── [N] Upload symlink shards (or legacy fallback) ────────────────────────
     cmd_prefix = ["wrangler"] if check_wrangler() else ["npx", "wrangler"]
-    result = subprocess.run(
-        cmd_prefix + ["r2", "object", "put",
-                      f"{bucket_name}/_symlinks.json",
-                      "--file", str(symlinks_json_path),
-                      "--content-type", "application/json"],
-        env=wrangler_env(account_id, api_token),
-        capture_output=True, text=True, timeout=30,
-    )
-    if not wrangler_ok(result, "R2 symlinks.json upload"):
-        return False
+    if shard_files:
+        for shard_path in shard_files:
+            shard_prefix = shard_path.stem
+            print(f"  [{next_step}/{STEPS}] Uploading symlinks/{shard_prefix}.json to R2...", end=" ", flush=True)
+            result = subprocess.run(
+                cmd_prefix + ["r2", "object", "put",
+                              f"{bucket_name}/_symlinks/{shard_prefix}.json",
+                              "--file", str(shard_path),
+                              "--content-type", "application/json"],
+                env=wrangler_env(account_id, api_token),
+                capture_output=True, text=True, timeout=60,
+            )
+            if not wrangler_ok(result, f"R2 symlinks/{shard_prefix}.json upload"):
+                return False
+            next_step += 1
+    elif has_legacy_symlink_file:
+        print(f"  [{next_step}/{STEPS}] Uploading symlinks.json to R2...", end=" ", flush=True)
+        result = subprocess.run(
+            cmd_prefix + ["r2", "object", "put",
+                          f"{bucket_name}/_symlinks.json",
+                          "--file", str(symlinks_json_path),
+                          "--content-type", "application/json"],
+            env=wrangler_env(account_id, api_token),
+            capture_output=True, text=True, timeout=60,
+        )
+        if not wrangler_ok(result, "R2 symlinks.json upload"):
+            return False
+        next_step += 1
+    else:
+        print("  No symlink shard files found — skipping symlink upload.")
 
-    # ── [3/4] Smoke test ──────────────────────────────────────────────────────
-    print(f"  [{next_step + 1}/{STEPS}] Smoke test...", end=" ", flush=True)
+    # ── [final] Smoke test ────────────────────────────────────────────────────
+    print(f"  [{next_step}/{STEPS}] Smoke test...", end=" ", flush=True)
     if route_specs:
         smoke_url = f"https://{route_specs[0][2]}/"
     else:
