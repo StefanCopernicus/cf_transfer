@@ -38,7 +38,6 @@ from urllib.parse import urlparse
 WEBROOT       = Path("/var/www")
 SITES_ENABLED = Path("/etc/apache2/sites-enabled")
 OUTPUT_BASE   = Path("./cf_worker_output")
-WORKERS_DEV_SUBDOMAIN = "aged-waterfall-d369"
 
 KNOWN_ID_PREFIXES = {"C", "S"}
 
@@ -435,9 +434,10 @@ def group_mirror_rules(rules: list[dict]) -> dict:
             parsed    = urlparse(r["to"])
             prefix    = parsed.path.strip("/").split("/")[0]
             r2_prefix = r.get("r2_prefix", "")
-            key       = (f"{parsed.scheme}://{parsed.netloc}", prefix, r2_prefix)
+            status    = int(r.get("status", 301))
+            key       = (f"{parsed.scheme}://{parsed.netloc}", prefix, r2_prefix, status)
         except Exception:
-            key = ("unknown", "unknown", "")
+            key = ("unknown", "unknown", "", int(r.get("status", 301)))
         groups[key].append(r)
     return dict(groups)
 
@@ -449,9 +449,10 @@ def group_letter_rules_by_prefix(mirror_letter: list[dict]) -> dict:
             parsed    = urlparse(r["to"])
             prefix    = parsed.path.strip("/").split("/")[0]
             r2_prefix = r.get("r2_prefix", "")
-            key       = (f"{parsed.scheme}://{parsed.netloc}", prefix, r["prefix"], r2_prefix)
+            status    = int(r.get("status", 301))
+            key       = (f"{parsed.scheme}://{parsed.netloc}", prefix, r["prefix"], r2_prefix, status)
         except Exception:
-            key = ("unknown", "unknown", r.get("prefix", "?"), "")
+            key = ("unknown", "unknown", r.get("prefix", "?"), "", int(r.get("status", 301)))
         groups[key].append(r)
     return dict(groups)
 
@@ -568,14 +569,19 @@ def build_symlink_map(
     symlinks:   list[SymlinkInfo],
     folder_map: list[tuple[str, str, bool]],
     vhosts:     list | None = None,
-) -> tuple[dict[str, str], list[dict]]:
+) -> tuple[dict[str, str], list[dict], dict[str, str]]:
     """
     Returns:
-      mapping       — path→path for same-prefix symlinks (served as R2 alias)
+      mapping       — R2-key→R2-key aliases for same-prefix symlinks
       cross_redirects — 301 redirect rules for symlinks that cross R2 prefixes
+      prefix_origin — prefix→origin base URL inferred from vhost server names
     """
     mapping:          dict[str, str] = {}
     cross_redirects:  list[dict]     = []
+    root_r2_prefix = next(
+        (r2 for local_name, r2, _ in folder_map if local_name.endswith(".copernicus.org")),
+        "",
+    )
 
     # Build prefix → canonical origin lookup from vhosts
     prefix_origin: dict[str, str] = {}
@@ -609,9 +615,11 @@ def build_symlink_map(
                 # so we just root it at WEBROOT/local_name, no prefix prepend needed
                 local_name_link   = _local_name_for_prefix(link_prefix,   folder_map)
                 local_name_target = _local_name_for_prefix(target_prefix, folder_map)
-                link_r2_path   = "/" + str(link_abs.relative_to(WEBROOT / local_name_link))
-                target_r2_path = "/" + str(target_abs.relative_to(WEBROOT / local_name_target))
-                mapping[link_r2_path] = target_r2_path
+                link_rel = str(link_abs.relative_to(WEBROOT / local_name_link)).replace("\\", "/")
+                target_rel = str(target_abs.relative_to(WEBROOT / local_name_target)).replace("\\", "/")
+                link_r2_key = f"/{link_prefix}/{link_rel}".rstrip("/")
+                target_r2_key = f"/{target_prefix}/{target_rel}".rstrip("/")
+                mapping[link_r2_key] = target_r2_key
             else:
                 local_name_link   = _local_name_for_prefix(link_prefix,   folder_map)
                 local_name_target = _local_name_for_prefix(target_prefix, folder_map)
@@ -621,7 +629,7 @@ def build_symlink_map(
                 target_url    = target_origin + target_r2_path if target_origin else target_r2_path
                 cross_redirects.append({
                     "type":   "exact",
-                    "scope":  f"/{link_prefix}/",
+                    "scope":  None if link_prefix == root_r2_prefix else f"/{link_prefix}/",
                     "from":   link_r2_path,
                     "to":     target_url,
                     "status": 301,
@@ -642,10 +650,41 @@ def _local_name_for_prefix(r2_prefix: str,
     return r2_prefix
 
 
-def generate_irregular_redirect_js(irregular: list[dict]) -> str:
+def collect_unmigrated_rewrite_rules(analysis: JournalAnalysis) -> list[str]:
+    lines: list[str] = []
+    for folder in analysis.folders:
+        for rw in folder.htaccess_rewrites:
+            flags = f" [{rw['flags']}]" if rw.get("flags") else ""
+            for cond in rw.get("conditions", []):
+                cflags = f" [{cond['flags']}]" if cond.get("flags") else ""
+                lines.append(
+                    f"{folder.name} (.htaccess): RewriteCond {cond['test_string']} {cond['condition']}{cflags}"
+                )
+            lines.append(
+                f"{folder.name} (.htaccess): RewriteRule {rw['pattern']} {rw['substitution']}{flags}"
+            )
+    for vhost in analysis.vhosts:
+        for rw in vhost.rewrites:
+            flags = f" [{rw['flags']}]" if rw.get("flags") else ""
+            for cond in rw.get("conditions", []):
+                cflags = f" [{cond['flags']}]" if cond.get("flags") else ""
+                lines.append(
+                    f"{vhost.conf_file.name}: RewriteCond {cond['test_string']} {cond['condition']}{cflags}"
+                )
+            lines.append(
+                f"{vhost.conf_file.name}: RewriteRule {rw['pattern']} {rw['substitution']}{flags}"
+            )
+    return lines
+
+
+def generate_irregular_redirect_js(irregular: list[dict], root_r2_prefix: str = "") -> str:
     lines = []
     for r in irregular:
-        scope    = r.get("scope") or (f'/{r.get("r2_prefix")}/' if r.get("r2_prefix") else "")
+        if r.get("scope") is not None:
+            scope = r.get("scope") or ""
+        else:
+            rp = r.get("r2_prefix")
+            scope = "" if (not rp or rp == root_r2_prefix) else f"/{rp}/"
         scope_js = f'"{scope}"' if scope else "null"
         status   = int(r.get("status", 301))
         rtype    = r.get("type", "")
@@ -678,35 +717,42 @@ def generate_index_js(
     symlink_map:    dict[str, str],
     origin_map:     dict[str, str],
     folder_map:     list[tuple[str, str, bool]],
+    unmigrated_rewrites: list[str] | None = None,
 ) -> str:
     sc = shortcut.upper()
+    root_r2_prefix = next(
+        (r2 for local_name, r2, _ in folder_map if local_name.endswith(".copernicus.org")),
+        folder_map[0][1] if folder_map else "",
+    )
 
     redirect_rules_lines = []
-    for (domain, prefix, r2_prefix), entries in numeric_groups.items():
+    for (domain, prefix, r2_prefix, status), entries in numeric_groups.items():
         base  = f"{domain}/{prefix}"
-        scope = f"'/{r2_prefix}/'" if r2_prefix else "null"
+        scope = "null" if r2_prefix == root_r2_prefix else f"'/{r2_prefix}/'"
+        scope_label = "/" if scope == "null" else f"/{r2_prefix}/"
         redirect_rules_lines += [
-            f"  // {len(entries)} rules (numeric) → {base}  [scope: /{r2_prefix}/]",
-            "  [" + scope + ", /^\\/(\\d+)\\/(\\d+)\\/(\\d+)\\/(.+)$/, '" + base + "/$1/$2/$3/$4', 301],",
-            "  [" + scope + ", /^\\/(\\d+)\\/(\\d+)\\/(\\d+)\\/$/, '" + base + "/$1/$2/$3/', 301],",
-            "  [" + scope + ", /^\\/(\\d+)\\/(\\d+)\\/$/, '" + base + "/$1/$2/', 301],",
+            f"  // {len(entries)} rules (numeric) → {base}  [scope: {scope_label}]",
+            "  [" + scope + ", /^\\/(\\d+)\\/(\\d+)\\/(\\d+)\\/(.+)$/, '" + base + f"/$1/$2/$3/$4', {status}],",
+            "  [" + scope + ", /^\\/(\\d+)\\/(\\d+)\\/(\\d+)\\/$/, '" + base + f"/$1/$2/$3/', {status}],",
+            "  [" + scope + ", /^\\/(\\d+)\\/(\\d+)\\/$/, '" + base + f"/$1/$2/', {status}],",
         ]
-    for (domain, prefix, letter, r2_prefix), entries in letter_groups.items():
+    for (domain, prefix, letter, r2_prefix, status), entries in letter_groups.items():
         base  = f"{domain}/{prefix}"
-        scope = f"'/{r2_prefix}/'" if r2_prefix else "null"
+        scope = "null" if r2_prefix == root_r2_prefix else f"'/{r2_prefix}/'"
+        scope_label = "/" if scope == "null" else f"/{r2_prefix}/"
         redirect_rules_lines += [
-            f"  // {len(entries)} rules ({letter}-id) → {base}  [scope: /{r2_prefix}/]",
-            f"  [{scope}, /^\\/[\\d]+\\/({letter}[\\d]+)\\/(.+)$/, '{base}/$1/$2', 301],",
-            f"  [{scope}, /^\\/[\\d]+\\/({letter}[\\d]+)\\/$/, '{base}/$1/', 301],",
+            f"  // {len(entries)} rules ({letter}-id) → {base}  [scope: {scope_label}]",
+            f"  [{scope}, /^\\/[\\d]+\\/({letter}[\\d]+)\\/(.+)$/, '{base}/$1/$2', {status}],",
+            f"  [{scope}, /^\\/[\\d]+\\/({letter}[\\d]+)\\/$/, '{base}/$1/', {status}],",
         ]
 
     redirect_rules_block = "\n".join(redirect_rules_lines)
-    irregular_block      = generate_irregular_redirect_js(irregular)
+    irregular_block      = generate_irregular_redirect_js(irregular, root_r2_prefix=root_r2_prefix)
     symlink_map_json     = json.dumps(symlink_map, indent=2)
 
-    # Build the JS ORIGIN_MAP literal:  { 'articles/': 'https://...', ... }
+    # Build the JS ORIGIN_MAP literal:  { 'articles': 'https://...', ... }
     origin_map_js = ", ".join(
-        f"'{r2_prefix}/': '{origin_url}'"
+        f"'{r2_prefix}': '{origin_url.rstrip('/')}'"
         for r2_prefix, origin_url in origin_map.items()
     )
     # Fallback: use the articles/ origin, or first entry, or a safe default
@@ -718,7 +764,8 @@ def generate_index_js(
 
     # Build PATH_TO_R2_PREFIX JS literal: { '': 'articles', 'supplements': 'supplements', ... }
     path_to_r2_prefix_js = ", ".join(
-        f"'': '{r2_prefix}'" if local_name == f"{shortcut}.copernicus.org" else f"'/{r2_prefix}': '{r2_prefix}'"
+        f"'': '{r2_prefix}'" if local_name.endswith(".copernicus.org")
+        else f"'{r2_prefix}': '{r2_prefix}'"
         for local_name, r2_prefix, _ in folder_map
     )
 
@@ -728,7 +775,20 @@ def generate_index_js(
         for local_name, r2_prefix, _ in folder_map
     )
 
-    return f"""\
+    rewrite_comment = ""
+    if unmigrated_rewrites:
+        rewrite_lines = "\n".join(
+            f" *   - {line}" for line in unmigrated_rewrites
+        )
+        rewrite_comment = (
+            "\n/*\n"
+            " * WARNING: Apache RewriteRule/RewriteCond directives were detected but not migrated.\n"
+            " * These rules require manual Worker implementation if still needed:\n"
+            f"{rewrite_lines}\n"
+            " */\n"
+        )
+
+    return rf"""\
 /**
  * Cloudflare Worker — {sc} journal
  * Auto-generated by cf_transfer.py
@@ -736,6 +796,8 @@ def generate_index_js(
  * R2 bucket layout:
 {prefix_routing}
  */
+{rewrite_comment}
+const STRICT_R2 = false;
 
 const REDIRECT_RULES = [
 {redirect_rules_block}
@@ -749,6 +811,32 @@ const SYMLINK_MAP_DEFAULT = {symlink_map_json};
 
 // Maps URL path prefix → R2 bucket prefix (generated from folder_map)
 const PATH_TO_R2_PREFIX = {{{path_to_r2_prefix_js}}};
+const NON_ROOT_PREFIXES = Object.keys(PATH_TO_R2_PREFIX).filter(p => p !== '');
+
+function urlPathToR2Key(pathname) {{
+  let bare = pathname.slice(1);
+  for (const [urlPrefix] of Object.entries(PATH_TO_R2_PREFIX)) {{
+    if (urlPrefix === '') continue;
+    if (bare === urlPrefix || bare.startsWith(urlPrefix + '/')) {{
+      return bare;
+    }}
+  }}
+  const rootPrefix = PATH_TO_R2_PREFIX[''] || '';
+  if (rootPrefix) bare = rootPrefix + '/' + bare;
+  return bare;
+}}
+
+function withDirectoryIndex(key) {{
+  if (key.endsWith('/') || key === '') return key + 'index.html';
+  if (!key.includes('.')) return key + '/index.html';
+  return key;
+}}
+
+function keyToR2Prefix(key) {{
+  const first = key.split('/')[0];
+  if (NON_ROOT_PREFIXES.includes(first)) return first;
+  return PATH_TO_R2_PREFIX[''] || first;
+}}
 
 let symlinkCache     = null;
 let symlinkCacheTime = 0;
@@ -790,17 +878,19 @@ async function resolveSSI(html, env, r2prefix) {{
   // Fetch all unique fragments in parallel
   const needed = [...new Set(matches.map(m => m[1]))];
   await Promise.all(needed.map(async (virtualPath) => {{
-    const cached = FRAGMENT_CACHE.get(virtualPath);
+    const cacheKey = r2prefix + ':' + virtualPath;
+    const cached = FRAGMENT_CACHE.get(cacheKey);
     if (cached && Date.now() - cached.ts < FRAGMENT_CACHE_TTL) return;
     const fragKey = r2prefix + '/' + virtualPath.replace(/^\//, '');
     const obj = await env.R2_BUCKET.get(fragKey);
     const content = obj ? await obj.text() : `<!-- SSI missing: ${{virtualPath}} -->`;
-    FRAGMENT_CACHE.set(virtualPath, {{ content, ts: Date.now() }});
+    FRAGMENT_CACHE.set(cacheKey, {{ content, ts: Date.now() }});
   }}));
 
   return html.replace(pat, (match, virtualPath) => {{
-    const content = FRAGMENT_CACHE.get(virtualPath)?.content;
-    return content !== undefined ? match + content : match + '<!-- SSI missing: ' + virtualPath + ' -->';
+    const cacheKey = r2prefix + ':' + virtualPath;
+    const content = FRAGMENT_CACHE.get(cacheKey)?.content;
+    return content !== undefined ? content : '<!-- SSI missing: ' + virtualPath + ' -->';
   }});
 }}
 
@@ -838,12 +928,10 @@ export default {{
 
     // 3. Resolve symlinks
     const symlinkMap = await getSymlinkMap(env);
-    if (symlinkMap[pathname]) pathname = symlinkMap[pathname];
-
-    // 4. Directory index fallback
-    let key = pathname.slice(1);
-    if (key.endsWith('/') || key === '') key = key + 'index.html';
-    else if (!key.includes('.'))         key = key + '/index.html';
+    let key = urlPathToR2Key(pathname);
+    const symlinkTarget = symlinkMap['/' + key];
+    if (symlinkTarget) key = symlinkTarget.replace(/^\/+/, '');
+    key = withDirectoryIndex(key);
 
     // 5. Try R2
     const object = await env.R2_BUCKET.get(key);
@@ -851,18 +939,14 @@ export default {{
       const ct = getContentType(key);
       if (ct.startsWith('text/html')) {{
         let body = await object.text();
-        const r2prefix = (() => {{
-          for (const [urlPrefix, prefix] of Object.entries(PATH_TO_R2_PREFIX)) {{
-            if (urlPrefix !== '' && key.startsWith(urlPrefix.slice(1) + '/')) return prefix;
-          }}
-          return PATH_TO_R2_PREFIX[''] || key.split('/')[0];
-        }})();
+        const r2prefix = keyToR2Prefix(key);
         body = await resolveSSI(body, env, r2prefix);
         return new Response(body, {{
           headers: {{
             'Content-Type':  ct,
             'Cache-Control': 'public, max-age=86400',
             'ETag':          object.httpEtag,
+            'X-R2-Hit':      '1',
           }},
         }});
       }}
@@ -871,21 +955,24 @@ export default {{
           'Content-Type':  ct,
           'Cache-Control': 'public, max-age=86400',
           'ETag':          object.httpEtag,
+          'X-R2-Hit':      '1',
         }},
       }});
     }}
 
     // 6. Fallback to origin — route by R2 prefix
     const ORIGIN_MAP = {{{origin_map_js}}};
-    const _pfx = Object.keys(ORIGIN_MAP).find(p => key.startsWith(p));
-    const _originBase = ORIGIN_MAP[_pfx] ?? '{fallback_origin}';
+    if (STRICT_R2) return new Response('Not Found', {{ status: 404 }});
+    const _originBase = ORIGIN_MAP[keyToR2Prefix(key)] ?? '{fallback_origin}';
     const originUrl = `${{_originBase}}${{url.pathname}}${{url.search}}`;
     try {{
       const originResp = await fetch(originUrl, {{
         headers: {{ 'X-Forwarded-From': 'cf-worker' }},
       }});
+      const hdrs = new Headers(originResp.headers);
+      hdrs.set('X-Origin-Fallback', '1');
       return new Response(originResp.body, {{
-        status: originResp.status, headers: originResp.headers,
+        status: originResp.status, headers: hdrs,
       }});
     }} catch (err) {{
       return new Response('Not Found', {{ status: 404 }});
@@ -936,9 +1023,13 @@ fi
 echo "    OK"
 
 echo "==> [3/4] Uploading symlinks.json..."
-curl -s -X PUT "${{CF_API}}/accounts/${{CF_ACCOUNT_ID}}/r2/buckets/${{BUCKET_NAME}}/objects/_symlinks.json" \\
+RESP=$(curl -s -w "\\n%{{http_code}}" -X PUT "${{CF_API}}/accounts/${{CF_ACCOUNT_ID}}/r2/buckets/${{BUCKET_NAME}}/objects/_symlinks.json" \\
   -H "${{AUTH}}" -H "Content-Type: application/json" \\
-  --data-binary "@${{SCRIPT_DIR}}/symlinks.json" >/dev/null
+  --data-binary "@${{SCRIPT_DIR}}/symlinks.json")
+HTTP_CODE=$(echo "$RESP" | tail -1)
+if [ "$HTTP_CODE" -lt 200 ] || [ "$HTTP_CODE" -ge 300 ]; then
+  echo "FAILED (HTTP $HTTP_CODE)"; exit 1
+fi
 echo "    OK"
 
 echo "==> [4/4] Smoke test..."
@@ -973,7 +1064,7 @@ def generate_deploy_readme(shortcut: str, custom_domain: str, bucket_name: str) 
 # ── Step 3 orchestration ──────────────────────────────────────────────────────
 
 
-def run_generate(analysis: JournalAnalysis) -> None:
+def run_generate(analysis: JournalAnalysis) -> bool:
     sc         = analysis.shortcut
     OUTPUT_DIR = get_output_dir(sc)          # ← add this line at the top
     custom_domain = f"{sc}.copernicus.org"   # default — always correct for this project
@@ -1005,9 +1096,18 @@ def run_generate(analysis: JournalAnalysis) -> None:
     numeric_groups, letter_groups, irregular = collect_all_redirects(analysis)
     irregular_all = irregular + cross_redirects   # ← merge cross-folder redirects in
 
-    index_js = generate_index_js(sc, numeric_groups, letter_groups,
-                                 irregular_all, symlink_map, prefix_origin,
-                                 folder_map)
+    unmigrated_rewrites = collect_unmigrated_rewrite_rules(analysis)
+    if unmigrated_rewrites:
+        print("\n  ⚠ WARNING: RewriteRule/RewriteCond directives were detected but are not migrated automatically.")
+        for line in unmigrated_rewrites:
+            print(f"    - {line}")
+        print("    These rules are listed in generated index.js for manual follow-up.\n")
+
+    index_js = generate_index_js(
+        sc, numeric_groups, letter_groups,
+        irregular_all, symlink_map, prefix_origin, folder_map,
+        unmigrated_rewrites=unmigrated_rewrites,
+    )
     symlinks_json = json.dumps(symlink_map, indent=2)
     deploy_sh     = generate_deploy_sh(sc, custom_domain, bucket_name)
     readme        = generate_deploy_readme(sc, custom_domain, bucket_name)
@@ -1046,6 +1146,7 @@ def run_generate(analysis: JournalAnalysis) -> None:
     if broken: print(f"  ⚠ Broken symlinks   : {len(broken)}")
     if extern: print(f"  ⚠ External symlinks : {len(extern)}")
     print(f"{'═' * 70}\n")
+    return True
 
 # ── Step 4: Deploy ────────────────────────────────────────────────────────────
 
@@ -1171,9 +1272,10 @@ def parse_workers_dev_url(wrangler_stdout: str, script_name: str) -> str | None:
         return f"https://{script_name}.{m.group(1)}.workers.dev"
     return None
 
-def run_deploy(analysis: JournalAnalysis) -> None:
+def run_deploy(analysis: JournalAnalysis) -> bool:
     env = get_cf_env()
-    if not env: return
+    if not env:
+        return False
     account_id, api_token, zone_id = env
 
     sc          = analysis.shortcut
@@ -1202,16 +1304,16 @@ def run_deploy(analysis: JournalAnalysis) -> None:
     symlinks_json_path = OUTPUT_DIR / "symlinks.json"
 
     if not index_js_path.exists():
-        print("  ERROR: index.js not found — run Generate first (option 3)."); return
+        print("  ERROR: index.js not found — run Generate first (option 3).")
+        return False
 
     index_js_content = index_js_path.read_text()
-    symlinks_content = symlinks_json_path.read_bytes() \
-                       if symlinks_json_path.exists() else b"{}"
 
     try:
         import requests
     except ImportError:
-        print("ERROR: pip install requests"); return
+        print("ERROR: pip install requests")
+        return False
 
     STEPS = 4 if zone_id else 3
 
@@ -1256,7 +1358,7 @@ bucket_name = "{bucket_name}"
         )
 
     if not wrangler_ok(result, "Worker upload"):
-        return
+        return False
 
     # Extract and cache the workers.dev URL from wrangler output
     workers_dev_url = parse_workers_dev_url(result.stdout, script_name)
@@ -1279,7 +1381,10 @@ bucket_name = "{bucket_name}"
         else:
             data = cf_api("POST", f"/zones/{zone_id}/workers/routes",
                           api_token, json=route_payload)
-        check_response(data, "Route setup")
+        try:
+            check_response(data, "Route setup")
+        except SystemExit:
+            return False
     else:
         print(f"  [2/{STEPS}] Route setup skipped — no Zone ID provided.")
         print(f"             Worker available at: "
@@ -1296,14 +1401,15 @@ bucket_name = "{bucket_name}"
         env=wrangler_env(account_id, api_token),
         capture_output=True, text=True, timeout=30,
     )
-    wrangler_ok(result, "R2 symlinks.json upload")
+    if not wrangler_ok(result, "R2 symlinks.json upload"):
+        return False
 
     # ── [3/4] Smoke test ──────────────────────────────────────────────────────
     print(f"  [{STEPS}/{STEPS}] Smoke test...", end=" ", flush=True)
     if zone_id:
-        smoke_url = f"https://{custom_domain}/web/"
+        smoke_url = f"https://{custom_domain}/"
     else:
-        smoke_url = f"{workers_dev_url}/web/"
+        smoke_url = f"{workers_dev_url}/"
     time.sleep(2)
     try:
         r = requests.get(smoke_url, allow_redirects=False, timeout=10)
@@ -1314,13 +1420,14 @@ bucket_name = "{bucket_name}"
     print(f"\n  ✓ Deployed.")
     if zone_id:
         print(f"  URL : https://{custom_domain}/")
-        print(f"  Also: {workers_dev_url}/web/")
+        print(f"  Also: {workers_dev_url}/")
     else:
-        print(f"  URL : {workers_dev_url}/web/")
+        print(f"  URL : {workers_dev_url}/")
         print(f"  To bind a custom domain later, set CF_ZONE_ID and re-run Deploy.")
     print(f"{'═' * 70}\n")
 
     (OUTPUT_DIR / ".deploy_done").touch()
+    return True
 
 # ── Step 5: Verify ────────────────────────────────────────────────────────────
 
@@ -1335,13 +1442,13 @@ class VerifyResult:
     note:        str = ""
 
 
-def http_head(url: str, timeout: int = 10) -> tuple[int | None, str | None]:
+def http_head(url: str, timeout: int = 10) -> tuple[int | None, str | None, dict[str, str]]:
     try:
         import requests
         r = requests.head(url, allow_redirects=False, timeout=timeout)
-        return r.status_code, r.headers.get("Location")
+        return r.status_code, r.headers.get("Location"), dict(r.headers)
     except:
-        return None, None
+        return None, None, {}
 
 
 def synthesise_test_paths(analysis: JournalAnalysis) -> list[str]:
@@ -1350,6 +1457,9 @@ def synthesise_test_paths(analysis: JournalAnalysis) -> list[str]:
 
     def add(p: str) -> None:
         if p not in seen: seen.add(p); paths.append(p)
+
+    add("/")
+    add("/index.html")
 
     sources = (
         [f.htaccess_redirects for f in analysis.folders if f.exists] +
@@ -1372,10 +1482,30 @@ def synthesise_test_paths(analysis: JournalAnalysis) -> list[str]:
                 add("/" + sample.lstrip("/"))
             elif r.get("from"):
                 add(r["from"])
+
+    folder_map = get_folder_map(analysis)
+    root_local = next((local for local, _, _ in folder_map if local.endswith(".copernicus.org")), None)
+    for folder in analysis.folders:
+        if not folder.exists:
+            continue
+        r2_prefix = next((r2 for local, r2, _ in folder_map if local == folder.name), None)
+        if not r2_prefix:
+            continue
+        url_prefix = "" if folder.name == root_local else f"/{r2_prefix}"
+        try:
+            first_entry = next((p for p in folder.path.rglob("*") if p.is_file() or p.is_dir()), None)
+        except PermissionError:
+            first_entry = None
+        if not first_entry:
+            continue
+        rel = str(first_entry.relative_to(folder.path)).replace("\\", "/")
+        if first_entry.is_dir():
+            rel = rel.rstrip("/") + "/"
+        add(f"{url_prefix}/{rel}".replace("//", "/"))
     return paths
 
 
-def run_verify(analysis: JournalAnalysis) -> None:
+def run_verify(analysis: JournalAnalysis) -> bool:
     sc         = analysis.shortcut
     OUTPUT_DIR = get_output_dir(sc)
 
@@ -1397,7 +1527,7 @@ def run_verify(analysis: JournalAnalysis) -> None:
         worker_base   = workers_dev_url
     else:
         print("  ERROR: No Zone ID and no deployed workers.dev URL found. Run Deploy first.")
-        return
+        return False
 
     print(f"\n{'═' * 70}")
     print(f"  Step 5 — Verify redirects")
@@ -1407,7 +1537,8 @@ def run_verify(analysis: JournalAnalysis) -> None:
 
     test_paths = synthesise_test_paths(analysis)
     if not test_paths:
-        print("\n  No redirect rules found to verify."); return
+        print("\n  No redirect/content paths found to verify.")
+        return False
 
     print(f"\n  Found {len(test_paths)} test paths.")
     limit_input = input(f"  Max paths to test [all]: ").strip()
@@ -1423,8 +1554,10 @@ def run_verify(analysis: JournalAnalysis) -> None:
     passed = failed = skipped = 0
 
     for path in test_paths:
-        o_code, o_loc = http_head(f"https://{origin_domain}{path}")
-        w_code, w_loc = http_head(f"{worker_base}{path}")
+        o_code, o_loc, _ = http_head(f"https://{origin_domain}{path}")
+        w_code, w_loc, w_headers = http_head(f"{worker_base}{path}")
+        is_r2_hit = (w_headers.get("X-R2-Hit") or w_headers.get("x-r2-hit")) == "1"
+        is_origin_fallback = (w_headers.get("X-Origin-Fallback") or w_headers.get("x-origin-fallback")) == "1"
 
         if o_code is None:
             match = w_code in (301, 302, 307, 308)
@@ -1437,6 +1570,16 @@ def run_verify(analysis: JournalAnalysis) -> None:
             else:
                 match = (o_code == w_code)
                 note  = "" if match else f"expected {o_code}"
+
+        if match:
+            if is_r2_hit:
+                note = (note + "; " if note else "") + "R2 hit"
+            elif is_origin_fallback:
+                note = (note + "; " if note else "") + "origin fallback"
+            elif w_code == 200:
+                note = (note + "; " if note else "") + "200 without R2/fallback header"
+        elif w_code == 200 and not is_r2_hit and not is_origin_fallback:
+            note = (note + "; " if note else "") + "mismatch without routing header"
 
         if match: passed += 1; flag = "✓"
         else:     failed += 1; flag = "✗"
@@ -1465,6 +1608,7 @@ def run_verify(analysis: JournalAnalysis) -> None:
     report_path.write_text(json.dumps([asdict(r) for r in results], indent=2))
     print(f"\n  Report saved to {report_path}")
     print(f"{'═' * 70}\n")
+    return failed == 0
 
 
 # ── Wrangler helpers ──────────────────────────────────────────────────────────
@@ -1484,18 +1628,6 @@ def wrangler_env(account_id: str, api_token: str) -> dict:
     env["CLOUDFLARE_API_TOKEN"]  = api_token
     env["CLOUDFLARE_ACCOUNT_ID"] = account_id
     return env
-
-
-def wrangler_run(args: list[str], account_id: str, api_token: str,
-                 timeout: int = 60) -> subprocess.CompletedProcess:
-    """Run a wrangler command with credentials injected via env vars."""
-    return subprocess.run(
-        ["wrangler"] + args,
-        env=wrangler_env(account_id, api_token),
-        capture_output=True,
-        text=True,
-        timeout=timeout,
-    )
 
 
 def wrangler_ok(result: subprocess.CompletedProcess, action: str) -> bool:
@@ -1536,13 +1668,14 @@ def validate_cf_credentials(account_id: str, api_token: str) -> bool:
 
 # ── Step 6: Cloudflare setup ──────────────────────────────────────────────────
 
-def run_setup(analysis: JournalAnalysis) -> None:
+def run_setup(analysis: JournalAnalysis) -> bool:
     env = get_cf_account()
-    if not env: return
+    if not env:
+        return False
     account_id, api_token = env
 
     if not validate_cf_credentials(account_id, api_token):
-        return
+        return False
 
     sc          = analysis.shortcut
     bucket_name = get_bucket_name(sc)
@@ -1562,7 +1695,7 @@ def run_setup(analysis: JournalAnalysis) -> None:
         print("  Or via npx (no install): the script will use npx automatically.")
         # Fallback to npx if available
         if not shutil.which("npx"):
-            return
+            return False
         print("  Found npx — will use 'npx wrangler' instead.")
 
     cmd_prefix = ["wrangler"] if check_wrangler() else ["npx", "wrangler"]
@@ -1588,7 +1721,7 @@ def run_setup(analysis: JournalAnalysis) -> None:
             capture_output=True, text=True, timeout=30,
         )
         if not wrangler_ok(result, "Create R2 bucket"):
-            return
+            return False
 
     # ── 2. Create folder markers ──────────────────────────────────────────────
     # R2 has no real directories — upload a zero-byte marker object per folder
@@ -1617,7 +1750,8 @@ def run_setup(analysis: JournalAnalysis) -> None:
                 env=wrangler_env(account_id, api_token),
                 capture_output=True, text=True, timeout=30,
             )
-            wrangler_ok(result, f"Create folder marker {r2_prefix}/")
+            if not wrangler_ok(result, f"Create folder marker {r2_prefix}/"):
+                return False
         finally:
             os.unlink(tmp_path)
 
@@ -1633,6 +1767,7 @@ def run_setup(analysis: JournalAnalysis) -> None:
     print(f"{'═' * 70}\n")
 
     (OUTPUT_DIR / ".setup_done").touch()
+    return True
 
 # ── Step 7: Sync via rclone ───────────────────────────────────────────────────
 
@@ -1653,7 +1788,7 @@ def check_rclone_remote(remote: str) -> bool:
         return False
 
 
-def generate_rclone_conf(bucket_name: str, account_id: str, api_token: str) -> str:
+def generate_rclone_conf(bucket_name: str, account_id: str) -> str:
     """
     Generate an rclone config snippet for Cloudflare R2.
     Uses the S3-compatible R2 endpoint.
@@ -1747,9 +1882,10 @@ def generate_sync_sh(
     return "\n".join(lines)
 
 
-def run_sync(analysis: JournalAnalysis) -> None:
+def run_sync(analysis: JournalAnalysis) -> bool:
     env = get_cf_account()
-    if not env: return
+    if not env:
+        return False
     account_id, api_token = env
 
     sc          = analysis.shortcut
@@ -1767,7 +1903,7 @@ def run_sync(analysis: JournalAnalysis) -> None:
         print("  ERROR: rclone not found.")
         print("  Install: https://rclone.org/install/")
         print("  e.g.:    curl https://rclone.org/install.sh | sudo bash")
-        return
+        return False
 
     rclone_version = subprocess.run(
         ["rclone", "version"], capture_output=True, text=True
@@ -1780,7 +1916,7 @@ def run_sync(analysis: JournalAnalysis) -> None:
         print(f"\n  ⚠ rclone remote '{REMOTE_NAME}' not configured.")
         print(f"  Generating rclone.conf snippet...")
 
-        conf_snippet = generate_rclone_conf(bucket_name, account_id, api_token)
+        conf_snippet = generate_rclone_conf(bucket_name, account_id)
         conf_path    = OUTPUT_DIR / "rclone.conf"
         OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
         conf_path.write_text(conf_snippet)
@@ -1800,7 +1936,7 @@ def run_sync(analysis: JournalAnalysis) -> None:
         sync_sh_path.write_text(sync_sh)
         sync_sh_path.chmod(0o755)
         print(f"  sync.sh saved to {sync_sh_path} — run it once rclone is configured.")
-        return
+        return False
 
     # ── Generate sync.sh ──────────────────────────────────────────────────────
     sync_sh      = generate_sync_sh(sc, folder_map, bucket_name, account_id)
@@ -1855,6 +1991,7 @@ def run_sync(analysis: JournalAnalysis) -> None:
                      "--dry-run", "--fast-list", "--progress",
                      "--exclude", ".htaccess", "--exclude", ".htpasswd",
                      "--exclude", ".DS_Store"],
+                    # Intentionally stream rclone output directly to terminal for live preview.
                     timeout=300
                 )
                 if result.returncode != 0:
@@ -1867,7 +2004,7 @@ def run_sync(analysis: JournalAnalysis) -> None:
 
         if not all_ok:
             print("  ⚠ Dry run had errors. Fix before proceeding.")
-            return
+            return False
 
     # ── Confirm real sync ─────────────────────────────────────────────────────
     print()
@@ -1875,7 +2012,7 @@ def run_sync(analysis: JournalAnalysis) -> None:
     if confirm != "y":
         print("  Sync cancelled.")
         print(f"  To sync manually later:  bash {sync_sh_path}")
-        return
+        return False
 
     # ── Live sync ─────────────────────────────────────────────────────────────
     print()
@@ -1893,6 +2030,7 @@ def run_sync(analysis: JournalAnalysis) -> None:
                  "--transfers", "16", "--fast-list", "--progress",
                  "--exclude", ".htaccess", "--exclude", ".htpasswd",
                  "--exclude", ".DS_Store"] + extra_flags,
+                # Intentionally stream rclone output directly to terminal for progress visibility.
                 timeout=7200
             )
             if result.returncode == 0:
@@ -1919,6 +2057,7 @@ def run_sync(analysis: JournalAnalysis) -> None:
     print(f"  Bucket: https://dash.cloudflare.com/{account_id}"
           f"/r2/default/buckets/{bucket_name}")
     print(f"{'═' * 70}\n")
+    return all_ok
 
 # ── Validation ────────────────────────────────────────────────────────────────
 
@@ -1953,9 +2092,9 @@ def analysis_to_dict(analysis: JournalAnalysis) -> dict:
                     "irregular":        classified["irregular"],
                     "unknown_prefixes": classified["unknown_prefixes"],
                     "collapsed_numeric": {f"{d}/{p}": collapsed_rules_text_numeric(d, p)
-                                          for (d, p, _r2) in num_groups},
+                                          for (d, p, _r2, _status) in num_groups},
                     "collapsed_letter":  {f"{d}/{p}/{lt}": collapsed_rules_text_letter(d, p, lt)
-                                          for (d, p, lt, _r2) in let_groups},
+                                          for (d, p, lt, _r2, _status) in let_groups},
                 },
                 "rewrites": f.htaccess_rewrites,
             },
@@ -2037,19 +2176,21 @@ def report_redirect_analysis(redirects: list[dict], analysis: JournalAnalysis,
 
     if mirror_num:
         print(f"\n    ✓ Collapsible numeric-path rules : {len(mirror_num)}")
-        for (domain, prefix, _r2), entries in num_groups.items():
+        for (domain, prefix, _r2, status), entries in num_groups.items():
             print(f"      Target: {domain}/{prefix}/  ({len(entries)} rules → 3 collapsed)")
-            for t in collapsed_rules_text_numeric(domain, prefix): print(f"        {t}")
+            for t in collapsed_rules_text_numeric(domain, prefix):
+                print(f"        {t.replace('301', str(status), 1)}")
 
     if mirror_letter:
         by_letter: dict[str, int] = defaultdict(int)
         for r in mirror_letter: by_letter[r["prefix"]] += 1
         summary = ", ".join(f"{c} {l}-id" for l, c in sorted(by_letter.items()))
         print(f"\n    ✓ Collapsible letter-id rules    : {len(mirror_letter)}  ({summary})")
-        for (domain, prefix, letter, _r2), entries in sorted(letter_groups.items()):
+        for (domain, prefix, letter, _r2, status), entries in sorted(letter_groups.items()):
             print(f"      [{letter}]  Target: {domain}/{prefix}/  "
                   f"({len(entries)} rules → 2 collapsed)")
-            for t in collapsed_rules_text_letter(domain, prefix, letter): print(f"        {t}")
+            for t in collapsed_rules_text_letter(domain, prefix, letter):
+                print(f"        {t.replace('301', str(status), 1)}")
 
     if unknown:
         print(f"\n    ⚠ Unknown letter-id prefixes: {', '.join(sorted(unknown))}")
@@ -2081,7 +2222,7 @@ def report_symlinks(symlinks: list[SymlinkInfo],
 
     # Classify same-prefix vs cross-prefix if folder_map provided
     if folder_map:
-        _, cross = build_symlink_map(file_aliases + dir_remaps, folder_map)
+        _, cross, _ = build_symlink_map(file_aliases + dir_remaps, folder_map)
         if cross:
             print(f"\n    ↪ Cross-folder symlinks ({len(cross)})  → will become 301 redirects:")
             for r in cross:
@@ -2154,6 +2295,13 @@ def print_report(analysis: JournalAnalysis) -> None:
     if analysis.warnings:
         print_section("Warnings")
         for w in analysis.warnings: print(f"  ⚠  {w}")
+
+    unmigrated = collect_unmigrated_rewrite_rules(analysis)
+    if unmigrated:
+        print_section("⚠ Unmigrated Apache Rewrite rules")
+        for line in unmigrated:
+            print(f"  - {line}")
+        print("  NOTE: RewriteRule/RewriteCond are parsed for visibility only and are not auto-migrated.")
 
     print(f"\n{'═' * 70}\n")
 
@@ -2278,10 +2426,22 @@ def run_menu(shortcut: str) -> None:
             analysis.vhosts  = discover_vhosts(shortcut)
             validate(analysis)
             print_report(analysis)
-            run_generate(analysis)
-            run_setup(analysis)
-            run_sync(analysis)
-            run_deploy(analysis)
+            if not run_generate(analysis):
+                print("  ✗ Generate failed — aborting.")
+                input("  Press Enter to return to menu...")
+                continue
+            if not run_setup(analysis):
+                print("  ✗ Setup failed — aborting.")
+                input("  Press Enter to return to menu...")
+                continue
+            if not run_sync(analysis):
+                print("  ✗ Sync failed — aborting.")
+                input("  Press Enter to return to menu...")
+                continue
+            if not run_deploy(analysis):
+                print("  ✗ Deploy failed — aborting.")
+                input("  Press Enter to return to menu...")
+                continue
             run_verify(analysis)
             input("  Press Enter to return to menu...")
 
@@ -2334,11 +2494,11 @@ def main() -> None:
     if json_out:  print(json.dumps(analysis_to_dict(analysis), indent=2))
     else:         print_report(analysis)
 
-    if generate:  run_generate(analysis)
-    if setup:     run_setup(analysis)
-    if sync:      run_sync(analysis)
-    if deploy:    run_deploy(analysis)
-    if verify:    run_verify(analysis)
+    if generate and not run_generate(analysis): return
+    if setup and not run_setup(analysis): return
+    if sync and not run_sync(analysis): return
+    if deploy and not run_deploy(analysis): return
+    if verify: run_verify(analysis)
 
     if analysis.errors:
         sys.exit(1)
