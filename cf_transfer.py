@@ -1449,12 +1449,6 @@ def run_deploy(analysis: JournalAnalysis) -> bool:
     # Pick custom_domain — prefer copernicus.org, fallback to constructed default
     custom_domain = urlparse(prefix_origin.get("articles", f"https://{sc}.copernicus.org")).hostname or f"{sc}.copernicus.org"
 
-    # Let user confirm or override
-    prompted = input(f"  Origin domain [{custom_domain}]: ").strip()
-    if prompted:
-        custom_domain = prompted
-        prefix_origin["articles"] = f"https://{custom_domain}"
-
     zone_ids = get_cf_zone_ids(folder_map, prefix_origin)
 
     index_js_path      = OUTPUT_DIR / "index.js"
