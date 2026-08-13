@@ -2084,6 +2084,14 @@ def generate_sync_sh(
         f"#   --checksum        sync by checksum   (slow but accurate)",
         f"#   --skip-existing   never overwrite files already in R2  (fastest)",
         f"#   --dry-run         preview only, no transfers",
+        f"#",
+        f"# Performance flags used:",
+        f"#   --transfers 32          parallel file transfers",
+        f"#   --checkers 32           parallel stat checks",
+        f"#   --multi-thread-streams 4  multi-threaded upload for large files",
+        f"#   --buffer-size 256M      read buffer per transfer",
+        f"#   --s3-upload-concurrency 8  parallel chunks per multipart upload",
+        f"#   --s3-chunk-size 64M     multipart chunk size",
         f"",
         f"set -euo pipefail",
         f"",
@@ -2105,7 +2113,7 @@ def generate_sync_sh(
         f"[ -n \"$EXISTING_FLAG\" ] && echo \"==> Skip-existing mode — already-present files will not be overwritten\"",
         f"",
         f"REMOTE=\"r2:{bucket_name}\"",
-        f"RCLONE_FLAGS=\"--transfers 16 --fast-list --progress $CHECKSUM_FLAG $EXISTING_FLAG $DRY_RUN\"",
+        f"RCLONE_FLAGS=\"--transfers 32 --checkers 32 --multi-thread-streams 4 --multi-thread-cutoff 10M --buffer-size 256M --s3-upload-concurrency 8 --s3-chunk-size 64M --fast-list --progress $CHECKSUM_FLAG $EXISTING_FLAG $DRY_RUN\"",
         f"",
         f"# Exclude Apache control files from the sync",
         f'EXCLUDES="--exclude .htaccess --exclude .htpasswd --exclude .DS_Store"',
@@ -2276,11 +2284,18 @@ def run_sync(analysis: JournalAnalysis) -> bool:
         try:
             result = subprocess.run(
                 ["rclone", "sync", local_path, dest,
-                 "--transfers", "16", "--fast-list", "--progress",
+                 "--transfers", "32",
+                 "--checkers", "32",
+                 "--multi-thread-streams", "4",
+                 "--multi-thread-cutoff", "10M",
+                 "--buffer-size", "256M",
+                 "--s3-upload-concurrency", "8",
+                 "--s3-chunk-size", "64M",
+                 "--fast-list", "--progress",
                  "--exclude", ".htaccess", "--exclude", ".htpasswd",
                  "--exclude", ".DS_Store"] + extra_flags,
                 # Intentionally stream rclone output directly to terminal for progress visibility.
-                timeout=7200
+                timeout=21600
             )
             if result.returncode == 0:
                 print(f"      ✓ Done")
@@ -2288,7 +2303,7 @@ def run_sync(analysis: JournalAnalysis) -> bool:
                 print(f"      ⚠ rclone exited {result.returncode}")
                 all_ok = False
         except subprocess.TimeoutExpired:
-            print(f"      ⚠ Timeout (>2h) — run manually: bash {sync_sh_path}")
+            print(f"      ⚠ Timeout (>6h) — run manually: bash {sync_sh_path}")
             all_ok = False
         except FileNotFoundError:
             print(f"      ⚠ Source not found: {local_path}")
