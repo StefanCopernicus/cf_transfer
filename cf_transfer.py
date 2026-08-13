@@ -479,7 +479,10 @@ def collapsed_rules_text_letter(domain: str, prefix: str, letter: str) -> list[s
 
 # ── Step 3: Worker file generation ───────────────────────────────────────────
 
-def collect_all_redirects(analysis: JournalAnalysis) -> tuple[dict, dict, list[dict]]:
+def collect_all_redirects(
+    analysis: JournalAnalysis,
+    prefix_origin: dict[str, str] | None = None,
+) -> tuple[dict, dict, list[dict]]:
     seen:          set[str]   = set()
     all_numeric:   list[dict] = []
     all_letter:    list[dict] = []
@@ -523,23 +526,25 @@ def collect_all_redirects(analysis: JournalAnalysis) -> tuple[dict, dict, list[d
                 resolved.append(r)
             sources.append((r2_prefix, resolved))
 
+    _po = prefix_origin or {}
     for r2_prefix, redirect_list in sources:
         classified = classify_redirects(redirect_list)
+        host = _host_for_prefix(r2_prefix, _po)
         for r in classified["mirror_numeric"]:
             key = r2_prefix + "|" + r.get("pattern", "") + "|" + r.get("to", "")
             if key not in seen:
                 seen.add(key)
-                all_numeric.append({**r, "r2_prefix": r2_prefix})
+                all_numeric.append({**r, "r2_prefix": r2_prefix, "host": host})
         for r in classified["mirror_letter"]:
             key = r2_prefix + "|" + r.get("pattern", "") + "|" + r.get("to", "")
             if key not in seen:
                 seen.add(key)
-                all_letter.append({**r, "r2_prefix": r2_prefix})
+                all_letter.append({**r, "r2_prefix": r2_prefix, "host": host})
         for r in classified["irregular"]:
             key = r2_prefix + "|" + r.get("pattern", r.get("from", "")) + "|" + r.get("to", "")
             if key not in seen:
                 seen.add(key)
-                all_irregular.append({**r, "r2_prefix": r2_prefix})
+                all_irregular.append({**r, "r2_prefix": r2_prefix, "host": host})
 
     return (
         group_mirror_rules(all_numeric),
@@ -693,6 +698,12 @@ def _local_name_for_prefix(r2_prefix: str,
     return r2_prefix
 
 
+def _host_for_prefix(r2_prefix: str, prefix_origin: dict[str, str]) -> str:
+    """Return the bare hostname for a given R2 prefix, or empty string if unknown."""
+    url = prefix_origin.get(r2_prefix, "")
+    return url.removeprefix("https://").removeprefix("http://").rstrip("/")
+
+
 def collect_unmigrated_rewrite_rules(analysis: JournalAnalysis) -> list[str]:
     lines: list[str] = []
     for folder in analysis.folders:
@@ -729,24 +740,26 @@ def generate_irregular_redirect_js(irregular: list[dict], root_r2_prefix: str = 
             rp = r.get("r2_prefix")
             scope = "" if (not rp or rp == root_r2_prefix) else f"/{rp}/"
         scope_js = f'"{scope}"' if scope else "null"
+        host = r.get("host", "")
+        host_js = f'"{host}"' if host else "null"
         status   = int(r.get("status", 301))
         rtype    = r.get("type", "")
 
         if rtype == "RedirectMatch":
             # Apache RedirectMatch uses a regex pattern
             lines.append(
-                f'  {{"type":"regex","scope":{scope_js},"pattern":{json.dumps(r["pattern"])},'
+                f'  {{"type":"regex","scope":{scope_js},"host":{host_js},"pattern":{json.dumps(r["pattern"])},'
                 f'"to":{json.dumps(r["to"])},"status":{status}}},'
             )
         elif rtype in ("Redirect", "exact"):
             # Apache Redirect uses an exact path match
             lines.append(
-                f'  {{"type":"exact","scope":{scope_js},"from":{json.dumps(r.get("from",""))},'
+                f'  {{"type":"exact","scope":{scope_js},"host":{host_js},"from":{json.dumps(r.get("from",""))},'
                 f'"to":{json.dumps(r["to"])},"status":{status}}},'
             )
         elif rtype == "regex":
             lines.append(
-                f'  {{"type":"regex","scope":{scope_js},"pattern":{json.dumps(r["pattern"])},'
+                f'  {{"type":"regex","scope":{scope_js},"host":{host_js},"pattern":{json.dumps(r["pattern"])},'
                 f'"to":{json.dumps(r["to"])},"status":{status}}},'
             )
     return "\n".join(lines)
@@ -774,20 +787,24 @@ def generate_index_js(
         base  = f"{domain}/{prefix}"
         scope = "null" if r2_prefix == root_r2_prefix else f"'/{r2_prefix}/'"
         scope_label = "/" if scope == "null" else f"/{r2_prefix}/"
+        host = _host_for_prefix(r2_prefix, origin_map)
+        host_js = f"'{host}'" if host else "null"
         redirect_rules_lines += [
             f"  // {len(entries)} rules (numeric) → {base}  [scope: {scope_label}]",
-            "  [" + scope + ", /^\\/(\\d+)\\/(\\d+)\\/(\\d+)\\/(.+)$/, '" + base + f"/$1/$2/$3/$4', {status}],",
-            "  [" + scope + ", /^\\/(\\d+)\\/(\\d+)\\/(\\d+)\\/$/, '" + base + f"/$1/$2/$3/', {status}],",
-            "  [" + scope + ", /^\\/(\\d+)\\/(\\d+)\\/$/, '" + base + f"/$1/$2/', {status}],",
+            "  [" + scope + ", /^\\/(\\d+)\\/(\\d+)\\/(\\d+)\\/(.+)$/, '" + base + f"/$1/$2/$3/$4', {status}, {host_js}],",
+            "  [" + scope + ", /^\\/(\\d+)\\/(\\d+)\\/(\\d+)\\/$/, '" + base + f"/$1/$2/$3/', {status}, {host_js}],",
+            "  [" + scope + ", /^\\/(\\d+)\\/(\\d+)\\/$/, '" + base + f"/$1/$2/', {status}, {host_js}],",
         ]
     for (domain, prefix, letter, r2_prefix, status), entries in letter_groups.items():
         base  = f"{domain}/{prefix}"
         scope = "null" if r2_prefix == root_r2_prefix else f"'/{r2_prefix}/'"
         scope_label = "/" if scope == "null" else f"/{r2_prefix}/"
+        host = _host_for_prefix(r2_prefix, origin_map)
+        host_js = f"'{host}'" if host else "null"
         redirect_rules_lines += [
             f"  // {len(entries)} rules ({letter}-id) → {base}  [scope: {scope_label}]",
-            f"  [{scope}, /^\\/[\\d]+\\/({letter}[\\d]+)\\/(.+)$/, '{base}/$1/$2', {status}],",
-            f"  [{scope}, /^\\/[\\d]+\\/({letter}[\\d]+)\\/$/, '{base}/$1/', {status}],",
+            f"  [{scope}, /^\\/[\\d]+\\/({letter}[\\d]+)\\/(.+)$/, '{base}/$1/$2', {status}, {host_js}],",
+            f"  [{scope}, /^\\/[\\d]+\\/({letter}[\\d]+)\\/$/, '{base}/$1/', {status}, {host_js}],",
         ]
 
     redirect_rules_block = "\n".join(redirect_rules_lines)
@@ -955,8 +972,9 @@ export default {{
     const url      = new URL(request.url);
     let   pathname = url.pathname;
 
-    // 1. Collapsed redirect rules  [scope, pattern, template, status]
-    for (const [scope, pattern, template, status] of REDIRECT_RULES) {{
+    // 1. Collapsed redirect rules  [scope, pattern, template, status, host]
+    for (const [scope, pattern, template, status, host] of REDIRECT_RULES) {{
+      if (host && url.hostname !== host) continue;
       if (scope && !pathname.startsWith(scope)) continue;
       const scoped1 = scope ? pathname.slice(scope.length - 1) : pathname;
       const m = scoped1.match(pattern);
@@ -968,6 +986,7 @@ export default {{
 
     // 2. Irregular redirects
     for (const rule of IRREGULAR_REDIRECTS) {{
+      if (rule.host && url.hostname !== rule.host) continue;
       if (rule.scope && !pathname.startsWith(rule.scope)) continue;
       // Strip the scope prefix so Apache patterns (^/foo) match correctly
       const scoped = rule.scope ? pathname.slice(rule.scope.length - 1) : pathname;
@@ -1194,7 +1213,10 @@ def run_generate(analysis: JournalAnalysis) -> bool:
     host_to_r2_prefix = collect_host_to_r2_prefix(analysis, folder_map, prefix_origin)
 
     # Pass cross_redirects into generate_index_js alongside irregular redirects:
-    numeric_groups, letter_groups, irregular = collect_all_redirects(analysis)
+    numeric_groups, letter_groups, irregular = collect_all_redirects(analysis, prefix_origin=prefix_origin)
+    for cr in cross_redirects:
+        if "host" not in cr:
+            cr["host"] = _host_for_prefix((cr.get("scope") or "").strip("/"), prefix_origin)
     irregular_all = irregular + cross_redirects   # ← merge cross-folder redirects in
 
     unmigrated_rewrites = collect_unmigrated_rewrite_rules(analysis)

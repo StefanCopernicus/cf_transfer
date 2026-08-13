@@ -331,6 +331,81 @@ class TestVerifyHeaders(unittest.TestCase):
             self.assertTrue(any("domain=atmos-chem-phys.net" in row["note"] for row in report))
 
 
+class TestHostFieldInRedirectRules(unittest.TestCase):
+    def test_host_for_prefix_strips_scheme_and_slash(self):
+        po = {"legacy": "https://atmos-phys.net/", "articles": "https://ap.copernicus.org"}
+        self.assertEqual(cf_transfer._host_for_prefix("legacy", po), "atmos-phys.net")
+        self.assertEqual(cf_transfer._host_for_prefix("articles", po), "ap.copernicus.org")
+        self.assertEqual(cf_transfer._host_for_prefix("unknown", po), "")
+
+    def test_irregular_redirect_js_emits_host(self):
+        rule = {
+            "type": "RedirectMatch",
+            "pattern": "^/index\\.html$",
+            "to": "https://ap.copernicus.org/articles/index.html",
+            "status": 301,
+            "r2_prefix": "legacy",
+            "host": "atmos-phys.net",
+        }
+        js = cf_transfer.generate_irregular_redirect_js([rule], root_r2_prefix="articles")
+        self.assertIn('"host":"atmos-phys.net"', js)
+
+    def test_irregular_redirect_js_null_host_when_empty(self):
+        rule = {
+            "type": "RedirectMatch",
+            "pattern": "^/index\\.html$",
+            "to": "https://ap.copernicus.org/articles/index.html",
+            "status": 301,
+            "r2_prefix": "legacy",
+            "host": "",
+        }
+        js = cf_transfer.generate_irregular_redirect_js([rule], root_r2_prefix="articles")
+        self.assertIn('"host":null', js)
+
+    def test_generate_index_js_emits_host_in_redirect_rules(self):
+        prefix_origin = {
+            "articles": "https://ap.copernicus.org",
+            "legacy": "https://atmos-phys.net",
+        }
+        folder_map = [
+            ("ap.copernicus.org", "articles", True),
+            ("ap", "legacy", True),
+        ]
+        # minimal numeric group for legacy
+        numeric_groups = {
+            ("https://ap.copernicus.org", "articles", "legacy", 301): [{"r2_prefix": "legacy"}]
+        }
+        js = cf_transfer.generate_index_js(
+            shortcut="ap",
+            numeric_groups=numeric_groups,
+            letter_groups={},
+            irregular=[],
+            symlink_map={},
+            origin_map=prefix_origin,
+            folder_map=folder_map,
+        )
+        self.assertIn("'atmos-phys.net'", js)
+        # 5-tuple destructuring in worker
+        self.assertIn("const [scope, pattern, template, status, host] of REDIRECT_RULES", js)
+        self.assertIn("if (host && url.hostname !== host) continue;", js)
+
+    def test_worker_js_irregular_host_guard_present(self):
+        folder_map = [
+            ("ap.copernicus.org", "articles", True),
+            ("ap", "legacy", True),
+        ]
+        js = cf_transfer.generate_index_js(
+            shortcut="ap",
+            numeric_groups={},
+            letter_groups={},
+            irregular=[],
+            symlink_map={},
+            origin_map={"articles": "https://ap.copernicus.org", "legacy": "https://atmos-phys.net"},
+            folder_map=folder_map,
+        )
+        self.assertIn("if (rule.host && url.hostname !== rule.host) continue;", js)
+
+
 class TestSynthesisePaths(unittest.TestCase):
     def test_includes_root_index_and_folder_sample_paths(self):
         with tempfile.TemporaryDirectory() as td:
