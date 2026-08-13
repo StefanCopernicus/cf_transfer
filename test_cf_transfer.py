@@ -337,7 +337,10 @@ class TestDeployFailureHandling(unittest.TestCase):
 
             with mock.patch.object(cf_transfer, "get_cf_account", return_value=("a" * 32, "token" * 8)), \
                  mock.patch.object(cf_transfer, "get_cf_zone_ids", return_value={}), \
-                 mock.patch.object(cf_transfer, "infer_prefix_origin", return_value={"articles": "https://acp.copernicus.org"}), \
+                 mock.patch.object(cf_transfer, "infer_prefix_origin", return_value={
+                     "articles": "https://acp.copernicus.org",
+                     "legacy": "https://legacy.example",
+                 }), \
                  mock.patch.object(cf_transfer, "get_output_dir", return_value=out), \
                  mock.patch.object(cf_transfer, "check_wrangler", return_value=True), \
                  mock.patch.object(cf_transfer, "wrangler_ok", return_value=True), \
