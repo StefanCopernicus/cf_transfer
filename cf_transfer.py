@@ -2089,6 +2089,7 @@ def generate_sync_sh(
         f"#   --transfers 32          parallel file transfers",
         f"#   --checkers 32           parallel stat checks",
         f"#   --multi-thread-streams 4  multi-threaded upload for large files",
+        f"#   --multi-thread-cutoff 10M  apply multi-threading for files over 10 MB",
         f"#   --buffer-size 256M      read buffer per transfer",
         f"#   --s3-upload-concurrency 8  parallel chunks per multipart upload",
         f"#   --s3-chunk-size 64M     multipart chunk size",
