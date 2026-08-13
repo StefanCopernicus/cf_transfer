@@ -119,7 +119,10 @@ class TestZoneIdCollection(unittest.TestCase):
             zone_ids = cf_transfer.get_cf_zone_ids(folder_map, prefix_origin)
 
         self.assertEqual(zone_ids, {"articles": "legacy-zone"})
-        self.assertTrue(any("atmos-chem-phys.net" in desc for _, desc in calls))
+        self.assertTrue(any(
+            desc.startswith("Zone ID for atmos-chem-phys.net (legacy/)\n")
+            for _, desc in calls
+        ))
 
 
 class TestDeployScriptGeneration(unittest.TestCase):
@@ -135,6 +138,7 @@ class TestDeployScriptGeneration(unittest.TestCase):
             },
         )
         self.assertIn('CF_ZONE_ID_ARTICLES:?not set', script)
+        self.assertIn('CF_ZONE_ID_ARTICLES="${CF_ZONE_ID_ARTICLES:-${CF_ZONE_ID:-}}"', script)
         self.assertIn('CF_ZONE_ID_WEB:-', script)
         self.assertIn('CF_ZONE_ID_LEGACY:-', script)
         self.assertIn('Setting route ${DOMAIN}/*', script)

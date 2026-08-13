@@ -1063,12 +1063,13 @@ set -euo pipefail
 SCRIPT_NAME="{script_name}"
 BUCKET_NAME="{bucket_name}"
 CUSTOM_DOMAIN="{custom_domain}"
-SCRIPT_DIR="$(cd "$(dirname ${{BASH_SOURCE[0]}})" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${{BASH_SOURCE[0]}}")" && pwd)"
 : "${{CF_ACCOUNT_ID:?not set}}"
 : "${{CF_API_TOKEN:?not set}}"
+CF_ZONE_ID_ARTICLES="${{CF_ZONE_ID_ARTICLES:-${{CF_ZONE_ID:-}}}}"
 : "${{CF_ZONE_ID_ARTICLES:?not set}}"
 CF_API="https://api.cloudflare.com/client/v4"
-AUTH="Authorization: ******"
+AUTH="Authorization: Bearer ${{CF_API_TOKEN}}"
 ROUTE_SPECS=(
 {route_specs_block}
 )
@@ -1400,6 +1401,7 @@ def get_cf_zone_ids(
             zone_ids["articles"] = legacy_zone_id
 
     return zone_ids
+
 
 def parse_workers_dev_url(wrangler_stdout: str, script_name: str) -> str | None:
     """Extract the workers.dev URL from wrangler deploy output."""
@@ -1746,7 +1748,7 @@ def run_verify(analysis: JournalAnalysis) -> bool:
         if not domain:
             continue
         for path in ("/", "/index.html"):
-            verify_path(path, f"https://{domain}", f"https://{domain}", f"domain={domain}")
+            verify_path(path, f"https://{domain}", worker_base, f"domain={domain}")
 
     print(f"\n  {'─'*70}")
     print(f"  {passed} passed  /  {failed} failed  /  {skipped} skipped")
