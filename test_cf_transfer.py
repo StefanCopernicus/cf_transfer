@@ -354,6 +354,38 @@ class TestDeployFailureHandling(unittest.TestCase):
             self.assertFalse(any("_symlinks.json" in cmd for cmd in flattened))
 
 
+class TestRunSetup(unittest.TestCase):
+    def test_bucket_existence_check_does_not_match_substrings(self):
+        with tempfile.TemporaryDirectory() as td:
+            analysis = cf_transfer.JournalAnalysis(shortcut="ar")
+            cp_list = cf_transfer.subprocess.CompletedProcess(
+                args=["wrangler", "r2", "bucket", "list"],
+                returncode=0,
+                stdout="bucket-ars\nbucket-foo\n",
+                stderr="",
+            )
+            cp_ok = cf_transfer.subprocess.CompletedProcess(args=["wrangler"], returncode=0, stdout="", stderr="")
+            run_calls = []
+
+            def fake_run(cmd, **kwargs):
+                run_calls.append(cmd)
+                if cmd[-2:] == ["bucket", "list"]:
+                    return cp_list
+                return cp_ok
+
+            with mock.patch.object(cf_transfer, "get_cf_account", return_value=("a" * 32, "token" * 8)), \
+                 mock.patch.object(cf_transfer, "validate_cf_credentials", return_value=True), \
+                 mock.patch.object(cf_transfer, "get_folder_map", return_value=[("ar.copernicus.org", "articles", True)]), \
+                 mock.patch.object(cf_transfer, "get_output_dir", return_value=Path(td)), \
+                 mock.patch.object(cf_transfer, "check_wrangler", return_value=True), \
+                 mock.patch.object(cf_transfer, "wrangler_ok", return_value=True), \
+                 mock.patch.object(cf_transfer.subprocess, "run", side_effect=fake_run):
+                ok = cf_transfer.run_setup(analysis)
+
+        self.assertTrue(ok)
+        self.assertTrue(any(cmd[-3:] == ["bucket", "create", "bucket-ar"] for cmd in run_calls))
+
+
 class TestVerifyHeaders(unittest.TestCase):
     def test_verify_notes_for_r2_hit_origin_fallback_and_mismatch(self):
         with tempfile.TemporaryDirectory() as td:
@@ -405,6 +437,47 @@ class TestVerifyHeaders(unittest.TestCase):
             self.assertTrue(ok)
             report = json.loads((out / "verify_report.json").read_text())
             self.assertTrue(any("domain=atmos-chem-phys.net" in row["note"] for row in report))
+
+    def test_verify_includes_symlink_results_in_report(self):
+        with tempfile.TemporaryDirectory() as td:
+            out = Path(td)
+            analysis = cf_transfer.JournalAnalysis(shortcut="acp")
+            (out / "symlinks.json").write_text(json.dumps({
+                "/articles/preprints/acp-2012-101/foo.pdf": "/articles/preprints/12/101/foo.pdf",
+                "/legacy/archive/bar.pdf": "/legacy/real/bar.pdf",
+            }))
+
+            head_calls = [
+                (200, None, {}), (200, None, {"X-R2-Hit": "1"}),
+                (200, None, {"X-R2-Hit": "1"}),
+                (200, None, {}),
+            ]
+
+            with mock.patch.object(cf_transfer, "get_output_dir", return_value=out), \
+                 mock.patch.object(cf_transfer, "get_cf_env", return_value=("a" * 32, "token" * 8, "zone")), \
+                 mock.patch.object(cf_transfer, "get_folder_map", return_value=[
+                     ("acp.copernicus.org", "articles", True),
+                     ("acp", "legacy", True),
+                 ]), \
+                 mock.patch.object(cf_transfer, "infer_prefix_origin", return_value={
+                     "articles": "https://acp.copernicus.org",
+                 }), \
+                 mock.patch.object(cf_transfer, "synthesise_test_paths", return_value=["/primary"]), \
+                 mock.patch.object(cf_transfer, "http_head", side_effect=head_calls), \
+                 mock.patch("builtins.input", side_effect=["", "2"]):
+                ok = cf_transfer.run_verify(analysis)
+
+            self.assertFalse(ok)
+            report = json.loads((out / "verify_report.json").read_text())
+            symlink_rows = [row for row in report if row["note"].startswith("symlink→")]
+            self.assertEqual([row["path"] for row in symlink_rows], [
+                "/preprints/acp-2012-101/foo.pdf",
+                "/legacy/archive/bar.pdf",
+            ])
+            self.assertTrue(symlink_rows[0]["match"])
+            self.assertFalse(symlink_rows[1]["match"])
+            self.assertIn("R2 hit", symlink_rows[0]["note"])
+            self.assertIn("HTTP 200 no-R2-hit", symlink_rows[1]["note"])
 
 
 class TestHostFieldInRedirectRules(unittest.TestCase):

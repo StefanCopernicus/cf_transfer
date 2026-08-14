@@ -1786,6 +1786,7 @@ def run_verify(analysis: JournalAnalysis) -> bool:
 
     results = []
     passed = failed = skipped = 0
+    symlink_passed = symlink_failed = 0
 
     def verify_path(path: str, origin_base: str, worker_base_for_path: str, domain_note: str = "") -> None:
         nonlocal passed, failed, skipped
@@ -1840,8 +1841,90 @@ def run_verify(analysis: JournalAnalysis) -> bool:
         for path in ("/", "/index.html"):
             verify_path(path, f"https://{domain}", worker_base, f"domain={domain}")
 
+    symlink_map: dict[str, str] = {}
+    symlinks_json_path = OUTPUT_DIR / "symlinks.json"
+    if symlinks_json_path.exists():
+        try:
+            loaded = json.loads(symlinks_json_path.read_text())
+            if isinstance(loaded, dict):
+                symlink_map = loaded
+        except Exception:
+            symlink_map = {}
+    else:
+        symlink_dir = OUTPUT_DIR / "symlinks"
+        if symlink_dir.is_dir():
+            for shard_path in sorted(symlink_dir.glob("*.json")):
+                try:
+                    loaded = json.loads(shard_path.read_text())
+                except Exception:
+                    continue
+                if isinstance(loaded, dict):
+                    symlink_map.update(loaded)
+
+    if symlink_map:
+        root_r2_prefix = next(
+            (r2 for local, r2, _ in folder_map if local.endswith(".copernicus.org")),
+            "articles",
+        )
+        symlink_items = list(symlink_map.items())
+        print(f"\n  Found {len(symlink_items)} symlink entries.")
+        limit_input = input("  Symlinks to verify [20]: ").strip()
+        try:
+            sym_limit = int(limit_input)
+        except ValueError:
+            sym_limit = 20
+        sym_limit = max(0, min(sym_limit, len(symlink_items)))
+
+        if sym_limit and sym_limit < len(symlink_items):
+            step = max(1, len(symlink_items) // sym_limit)
+            symlink_sample = symlink_items[::step][:sym_limit]
+        else:
+            symlink_sample = symlink_items if sym_limit or not limit_input else []
+
+        print(f"\n  Verifying {len(symlink_sample)} symlinks...")
+        print()
+
+        for r2_key, r2_target in symlink_sample:
+            stripped = r2_key.lstrip("/")
+            parts = stripped.split("/", 1)
+            if parts[0] == root_r2_prefix:
+                suffix = parts[1] if len(parts) > 1 else ""
+                url_path = "/" + suffix if suffix else "/"
+            else:
+                url_path = "/" + stripped
+
+            w_code, w_loc, w_headers = http_head(f"{worker_base}{url_path}")
+            is_r2_hit = (w_headers.get("X-R2-Hit") or w_headers.get("x-r2-hit")) == "1"
+            match = (w_code == 200 and is_r2_hit)
+            status = str(w_code) if w_code is not None else "---"
+            note = "R2 hit" if match else (f"HTTP {status}" + (" no-R2-hit" if w_code == 200 else ""))
+
+            if match:
+                passed += 1
+                symlink_passed += 1
+                flag = "✓"
+            else:
+                failed += 1
+                symlink_failed += 1
+                flag = "✗"
+
+            disp = url_path if len(url_path) <= col_path else url_path[:col_path-1] + "…"
+            print(f"  {disp:<{col_path}}  {'---':>8}  {status:>8}  {flag} symlink; {note}")
+            results.append(VerifyResult(
+                path=url_path,
+                origin_code=None,
+                origin_loc=None,
+                worker_code=w_code,
+                worker_loc=w_loc,
+                match=match,
+                note=f"symlink→{r2_target}; {note}",
+            ))
+
     print(f"\n  {'─'*70}")
-    print(f"  {passed} passed  /  {failed} failed  /  {skipped} skipped")
+    summary = f"  {passed} passed  /  {failed} failed  /  {skipped} skipped"
+    if symlink_passed or symlink_failed:
+        summary += f"  /  symlinks: {symlink_passed} passed, {symlink_failed} failed"
+    print(summary)
 
     if failed:
         print(f"\n  Failed paths:")
@@ -1961,7 +2044,8 @@ def run_setup(analysis: JournalAnalysis) -> bool:
         capture_output=True, text=True, timeout=30,
     )
 
-    if bucket_name in (list_result.stdout or ""):
+    existing_buckets = [line.strip() for line in (list_result.stdout or "").splitlines()]
+    if bucket_name in existing_buckets:
         print("already exists — skipping")
     else:
         result = subprocess.run(
