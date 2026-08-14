@@ -1584,7 +1584,7 @@ bucket_name = "{bucket_name}"
         for _, zone_id, domain in route_specs:
             print(f"  [{next_step}/{STEPS}] Setting route {domain}/*...", end=" ", flush=True)
             route_pattern = f"{domain}/*"
-            existing      = cf_api("GET", f"/zones/{zone_id}/workers/routes", api_token)
+            existing      = cf_api("GET", f"/zones/{zone_id}/workers/routes", api_token) or {}
             existing_id   = next((r["id"] for r in existing.get("result", [])
                                    if r.get("pattern") == route_pattern), None)
             route_payload = {"pattern": route_pattern, "script": script_name}
@@ -2053,8 +2053,19 @@ def run_setup(analysis: JournalAnalysis) -> bool:
             env=wrangler_env(account_id, api_token),
             capture_output=True, text=True, timeout=30,
         )
-        if not wrangler_ok(result, "Create R2 bucket"):
-            return False
+        output = (result.stdout or "") + (result.stderr or "")
+        if result.returncode != 0:
+            if "10004" in output or "already exists" in output.lower():
+                print("already exists — skipping")
+            else:
+                print("FAILED")
+                for line in output.splitlines():
+                    line = line.strip()
+                    if line:
+                        print(f"          {line}")
+                return False
+        else:
+            print("OK")
 
     # ── 2. Create folder markers ──────────────────────────────────────────────
     # R2 has no real directories — upload a zero-byte marker object per folder
