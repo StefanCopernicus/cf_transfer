@@ -1780,9 +1780,9 @@ def run_verify(analysis: JournalAnalysis) -> bool:
     except: pass
 
     print()
-    col_path = 45
-    print(f"  {'Path':<{col_path}}  {'Origin':>8}  {'Worker':>8}  Result")
-    print(f"  {'─'*col_path}  {'─'*8}  {'─'*8}  {'─'*10}")
+    col_url = 50
+    print(f"  {'Origin URL':<{col_url}}  {'Worker URL':<{col_url}}  {'Origin':>6}  {'Worker':>6}  Result")
+    print(f"  {'─'*col_url}  {'─'*col_url}  {'─'*6}  {'─'*6}  {'─'*10}")
 
     results = []
     passed = failed = skipped = 0
@@ -1790,8 +1790,10 @@ def run_verify(analysis: JournalAnalysis) -> bool:
 
     def verify_path(path: str, origin_base: str, worker_base_for_path: str, domain_note: str = "") -> None:
         nonlocal passed, failed, skipped
-        o_code, o_loc, _ = http_head(f"{origin_base}{path}")
-        w_code, w_loc, w_headers = http_head(f"{worker_base_for_path}{path}")
+        o_url = f"{origin_base}{path}"
+        w_url = f"{worker_base_for_path}{path}"
+        o_code, o_loc, _ = http_head(o_url)
+        w_code, w_loc, w_headers = http_head(w_url)
         is_r2_hit = (w_headers.get("X-R2-Hit") or w_headers.get("x-r2-hit")) == "1"
         is_origin_fallback = (w_headers.get("X-Origin-Fallback") or w_headers.get("x-origin-fallback")) == "1"
 
@@ -1822,9 +1824,10 @@ def run_verify(analysis: JournalAnalysis) -> bool:
         if match: passed += 1; flag = "✓"
         else:     failed += 1; flag = "✗"
 
-        disp = path if len(path) <= col_path else path[:col_path-1] + "…"
-        print(f"  {disp:<{col_path}}  {str(o_code) if o_code else '---':>8}  "
-              f"{str(w_code) if w_code else '---':>8}  {flag} {note}")
+        disp_o = o_url if len(o_url) <= col_url else o_url[:col_url-1] + "…"
+        disp_w = w_url if len(w_url) <= col_url else w_url[:col_url-1] + "…"
+        print(f"  {disp_o:<{col_url}}  {disp_w:<{col_url}}  {str(o_code) if o_code else '---':>6}  "
+              f"{str(w_code) if w_code else '---':>6}  {flag} {note}")
         results.append(VerifyResult(path=path, origin_code=o_code, origin_loc=o_loc,
                                     worker_code=w_code, worker_loc=w_loc,
                                     match=match, note=note))
@@ -1908,8 +1911,10 @@ def run_verify(analysis: JournalAnalysis) -> bool:
                 symlink_failed += 1
                 flag = "✗"
 
-            disp = url_path if len(url_path) <= col_path else url_path[:col_path-1] + "…"
-            print(f"  {disp:<{col_path}}  {'---':>8}  {status:>8}  {flag} symlink; {note}")
+            disp_o = "---"
+            w_full = f"{worker_base}{url_path}"
+            disp_w = w_full if len(w_full) <= col_url else w_full[:col_url-1] + "…"
+            print(f"  {disp_o:<{col_url}}  {disp_w:<{col_url}}  {'---':>6}  {status:>6}  {flag} symlink; {note}")
             results.append(VerifyResult(
                 path=url_path,
                 origin_code=None,
