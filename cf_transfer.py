@@ -2316,6 +2316,7 @@ def run_sync(analysis: JournalAnalysis) -> bool:
 
     # ── Sync mode ────────────────────────────────────────────────────────────
     extra_flags = ["--checksum"]
+    print()
     print("  Sync mode: checksum (always)")
 
     # ── Dry run first ─────────────────────────────────────────────────────────
