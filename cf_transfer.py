@@ -39,6 +39,8 @@ from urllib.parse import urlparse
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 
+VERSION       = "1.3.0"
+
 WEBROOT       = Path("/var/www")
 SITES_ENABLED = Path("/etc/apache2/sites-enabled")
 OUTPUT_BASE   = Path("./cf_worker_output")
@@ -1590,10 +1592,10 @@ bucket_name = "{bucket_name}"
             route_payload = {"pattern": route_pattern, "script": script_name}
             if existing_id:
                 data = cf_api("PUT", f"/zones/{zone_id}/workers/routes/{existing_id}",
-                              api_token, json=route_payload)
+                              api_token, json=route_payload) or {}
             else:
                 data = cf_api("POST", f"/zones/{zone_id}/workers/routes",
-                              api_token, json=route_payload)
+                              api_token, json=route_payload) or {}
             try:
                 check_response(data, f"Route setup ({domain})")
             except SystemExit:
@@ -2178,11 +2180,8 @@ def generate_sync_sh(
         f"# Requires rclone with an 'r2' remote configured.",
         f"# See rclone.conf in this directory for setup instructions.",
         f"#",
-        f"# Usage:  bash sync.sh [--dry-run] [--checksum] [--skip-existing]",
+        f"# Usage:  bash sync.sh [--dry-run]",
         f"#",
-        f"#   (no flag)         sync by size+time  (default, fast)",
-        f"#   --checksum        sync by checksum   (slow but accurate)",
-        f"#   --skip-existing   never overwrite files already in R2  (fastest)",
         f"#   --dry-run         preview only, no transfers",
         f"#",
         f"# Performance flags used:",
@@ -2197,24 +2196,18 @@ def generate_sync_sh(
         f"set -euo pipefail",
         f"",
         f"DRY_RUN=\"\"",
-        f"CHECKSUM_FLAG=\"\"",
-        f"EXISTING_FLAG=\"\"",
         f"",
         f"for arg in \"$@\"; do",
         f"  case \"$arg\" in",
         f"    --dry-run)       DRY_RUN=\"--dry-run\" ;;",
-        f"    --checksum)      CHECKSUM_FLAG=\"--checksum\" ;;",
-        f"    --skip-existing) EXISTING_FLAG=\"--ignore-existing\" ;;",
         f"    *) echo \"Unknown option: $arg\"; exit 1 ;;",
         f"  esac",
         f"done",
         f"",
         f"[ -n \"$DRY_RUN\" ]       && echo \"==> DRY RUN mode — no files will be transferred\"",
-        f"[ -n \"$CHECKSUM_FLAG\" ] && echo \"==> Checksum mode — comparing by hash (slow)\"",
-        f"[ -n \"$EXISTING_FLAG\" ] && echo \"==> Skip-existing mode — already-present files will not be overwritten\"",
         f"",
         f"REMOTE=\"r2:{bucket_name}\"",
-        f"RCLONE_FLAGS=\"--transfers 32 --checkers 32 --multi-thread-streams 4 --multi-thread-cutoff 10M --buffer-size 256M --s3-upload-concurrency 8 --s3-chunk-size 64M --fast-list --progress $CHECKSUM_FLAG $EXISTING_FLAG $DRY_RUN\"",
+        f"RCLONE_FLAGS=\"--transfers 32 --checkers 32 --multi-thread-streams 4 --multi-thread-cutoff 10M --buffer-size 256M --s3-upload-concurrency 8 --s3-chunk-size 64M --checksum --fast-list --progress $DRY_RUN\"",
         f"",
         f"# Exclude Apache control files from the sync",
         f'EXCLUDES="--exclude .htaccess --exclude .htpasswd --exclude .DS_Store"',
@@ -2322,17 +2315,8 @@ def run_sync(analysis: JournalAnalysis) -> bool:
     print()
 
     # ── Sync mode ────────────────────────────────────────────────────────────
-    print()
-    print("  Sync mode:")
-    print("    [1]  Normal        — size+time comparison  (default, fast)")
-    print("    [2]  Checksum      — compare by hash       (slow but accurate)")
-    print("    [3]  Skip existing — never overwrite R2    (fastest, initial fill)")
-    mode = input("  Mode [1]: ").strip() or "1"
-    extra_flags = {
-        "1": [],
-        "2": ["--checksum"],
-        "3": ["--ignore-existing"],
-    }.get(mode, [])
+    extra_flags = ["--checksum"]
+    print("  Sync mode: checksum (always)")
 
     # ── Dry run first ─────────────────────────────────────────────────────────
     want_dry = input("  Run dry-run first to preview changes? [Y/n]: ").strip().lower()
@@ -2698,7 +2682,7 @@ def print_menu(analysis: JournalAnalysis | None, shortcut: str) -> None:
                       if workers_dev_url_path.exists() else None
 
     print(f"\n{'═' * 70}")
-    print(f"  Cloudflare Transfer Tool  —  journal: {sc}")
+    print(f"  Cloudflare Transfer Tool v{VERSION}  —  journal: {sc}")
     print(f"{'═' * 70}")
     print(f"  Status:")
     print(f"    Analysis  : {'✓ done' if analysis else '– not run'}")
