@@ -1478,6 +1478,24 @@ def get_cf_zone_ids(
     return zone_ids
 
 
+def load_zone_ids(output_dir: Path) -> dict[str, str]:
+    """Load saved zone IDs from disk. Returns {} if not found."""
+    path = output_dir / ".zone_ids"
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text())
+    except Exception:
+        return {}
+
+
+def save_zone_ids(output_dir: Path, zone_ids: dict[str, str]) -> None:
+    """Persist zone IDs to disk."""
+    if zone_ids:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        (output_dir / ".zone_ids").write_text(json.dumps(zone_ids, indent=2))
+
+
 def parse_workers_dev_url(wrangler_stdout: str, script_name: str) -> str | None:
     """Extract the workers.dev URL from wrangler deploy output."""
     # wrangler prints: "https://sd-worker.aged-waterfall-d369.workers.dev"
@@ -1499,10 +1517,17 @@ def run_deploy(analysis: JournalAnalysis) -> bool:
     folder_map  = get_folder_map(analysis)
     prefix_origin = infer_prefix_origin(analysis, folder_map)
 
+    # Pre-populate credentials from saved zone IDs
+    for r2_prefix, zid in load_zone_ids(OUTPUT_DIR).items():
+        env_name = f"CF_ZONE_ID_{r2_prefix.upper().replace('-', '_')}"
+        if env_name not in _cf_credentials:
+            _cf_credentials[env_name] = zid
+
     # Pick custom_domain — prefer copernicus.org, fallback to constructed default
     custom_domain = urlparse(prefix_origin.get("articles", f"https://{sc}.copernicus.org")).hostname or f"{sc}.copernicus.org"
 
     zone_ids = get_cf_zone_ids(folder_map, prefix_origin)
+    save_zone_ids(OUTPUT_DIR, zone_ids)
 
     index_js_path      = OUTPUT_DIR / "index.js"
     symlinks_json_path = OUTPUT_DIR / "symlinks.json"
@@ -1744,6 +1769,12 @@ def run_verify(analysis: JournalAnalysis) -> bool:
     OUTPUT_DIR = get_output_dir(sc)
     folder_map = get_folder_map(analysis)
     prefix_origin = infer_prefix_origin(analysis, folder_map)
+
+    # Pre-populate credentials from saved zone IDs
+    for r2_prefix, zid in load_zone_ids(OUTPUT_DIR).items():
+        env_name = f"CF_ZONE_ID_{r2_prefix.upper().replace('-', '_')}"
+        if env_name not in _cf_credentials:
+            _cf_credentials[env_name] = zid
 
     # Origin is always the real copernicus.org domain
     origin_domain = urlparse(prefix_origin.get("articles", f"https://{sc}.copernicus.org")).hostname or f"{sc}.copernicus.org"
@@ -2666,6 +2697,7 @@ MENU_ITEMS = [
     ("6", "Deploy",      "Step 6:   Deploy Worker to Cloudflare via API"),
     ("7", "Verify",      "Step 7:   Verify redirects against origin + Worker"),
     ("8", "Run all",     "Steps 1–7 in sequence"),
+    ("z", "Zone IDs",   "View / edit saved Zone IDs for this journal"),
     ("c", "Credentials", "Clear cached CF credentials (re-enter on next API call)"),
     ("q", "Quit",        ""),
 ]
@@ -2705,6 +2737,12 @@ def print_menu(analysis: JournalAnalysis | None, shortcut: str) -> None:
     else:
         print(f"    Deployed  : {'✓ done' if deployed else '– not run'}")
     print(f"    Verified  : {'✓ done' if verified   else '– not run'}")
+    saved_zone_ids = load_zone_ids(OUTPUT_DIR)
+    if saved_zone_ids:
+        zid_prefixes = ", ".join(saved_zone_ids.keys())
+        print(f"    Zone IDs  : ✓ saved ({zid_prefixes})")
+    else:
+        print(f"    Zone IDs  : – not configured  (use [z] to set)")
     print()
     for key, label, desc in MENU_ITEMS:
         if desc: print(f"  [{key}]  {label:<14}  {desc}")
@@ -2793,6 +2831,38 @@ def run_menu(shortcut: str) -> None:
                 input("  Press Enter to return to menu...")
                 continue
             run_verify(analysis)
+            input("  Press Enter to return to menu...")
+
+        elif choice == "z":
+            OUTPUT_DIR = get_output_dir(shortcut)
+            folder_map = get_folder_map(analysis)
+            prefix_origin = infer_prefix_origin(analysis, folder_map)
+            saved = load_zone_ids(OUTPUT_DIR)
+            print(f"\n  Saved Zone IDs for {shortcut.upper()}:")
+            if saved:
+                for r2_prefix, zid in saved.items():
+                    domain = urlparse(prefix_origin.get(r2_prefix, "")).hostname or r2_prefix
+                    print(f"    {r2_prefix:<20} {domain:<35} {zid}")
+            else:
+                print("    – none saved")
+            print()
+            edit = input("  Re-enter Zone IDs? [y/N]: ").strip().lower()
+            if edit == "y":
+                # Clear cached zone ID credentials so prompts fire again
+                for _, r2_prefix, _ in folder_map:
+                    env_name = f"CF_ZONE_ID_{r2_prefix.upper().replace('-', '_')}"
+                    _cf_credentials.pop(env_name, None)
+                _cf_credentials.pop("CF_ZONE_ID", None)
+                new_zone_ids = get_cf_zone_ids(folder_map, prefix_origin)
+                if new_zone_ids:
+                    save_zone_ids(OUTPUT_DIR, new_zone_ids)
+                    # Re-populate cache
+                    for r2_prefix, zid in new_zone_ids.items():
+                        env_name = f"CF_ZONE_ID_{r2_prefix.upper().replace('-', '_')}"
+                        _cf_credentials[env_name] = zid
+                    print(f"  ✓ Zone IDs saved.")
+                else:
+                    print("  No Zone IDs entered — existing saved IDs unchanged.")
             input("  Press Enter to return to menu...")
 
         elif choice == "c":

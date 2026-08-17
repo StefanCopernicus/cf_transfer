@@ -589,5 +589,34 @@ class TestSynthesisePaths(unittest.TestCase):
             self.assertIn("/legacy/legacyfile.html", paths)
 
 
+class TestZoneIdPersistence(unittest.TestCase):
+    def test_save_and_load_zone_ids(self):
+        with tempfile.TemporaryDirectory() as td:
+            output_dir = Path(td)
+            zone_ids = {"articles": "abc123", "web": "def456"}
+            cf_transfer.save_zone_ids(output_dir, zone_ids)
+            loaded = cf_transfer.load_zone_ids(output_dir)
+            self.assertEqual(loaded, zone_ids)
+
+    def test_load_zone_ids_returns_empty_when_missing(self):
+        with tempfile.TemporaryDirectory() as td:
+            output_dir = Path(td)
+            loaded = cf_transfer.load_zone_ids(output_dir)
+            self.assertEqual(loaded, {})
+
+    def test_load_zone_ids_returns_empty_on_corrupt_file(self):
+        with tempfile.TemporaryDirectory() as td:
+            output_dir = Path(td)
+            (output_dir / ".zone_ids").write_text("not valid json{{")
+            loaded = cf_transfer.load_zone_ids(output_dir)
+            self.assertEqual(loaded, {})
+
+    def test_save_zone_ids_does_nothing_when_empty(self):
+        with tempfile.TemporaryDirectory() as td:
+            output_dir = Path(td)
+            cf_transfer.save_zone_ids(output_dir, {})
+            self.assertFalse((output_dir / ".zone_ids").exists())
+
+
 if __name__ == "__main__":
     unittest.main()
