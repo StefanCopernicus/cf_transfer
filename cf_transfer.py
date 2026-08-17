@@ -1445,13 +1445,30 @@ def get_cf_env() -> tuple[str, str, str | None] | None:
 def get_cf_zone_ids(
     folder_map: list[tuple[str, str, bool]],
     prefix_origin: dict[str, str],
+    api_token: str = "",
 ) -> dict[str, str]:
     """Prompt for per-prefix zone IDs used to bind Worker routes."""
     zone_ids: dict[str, str] = {}
+    auto_found: list[str] = []
+    manual_entered: list[str] = []
     for _, r2_prefix, _ in folder_map:
         env_name = f"CF_ZONE_ID_{r2_prefix.upper().replace('-', '_')}"
         domain = urlparse(prefix_origin.get(r2_prefix, "")).hostname
         label = f"{domain} ({r2_prefix}/)" if domain else f"{r2_prefix}/"
+
+        # Try auto-discovery first
+        if api_token and domain:
+            resp = cf_api("GET", f"/zones?name={domain}", api_token)
+            result = (resp or {}).get("result", [])
+            if result:
+                zone_id = result[0]["id"]
+                print(f"  Auto-discovered Zone ID for {domain}: {zone_id}")
+                zone_ids[r2_prefix] = zone_id
+                _cf_credentials[env_name] = zone_id
+                auto_found.append(r2_prefix)
+                continue
+
+        # Fall back to manual prompt
         zone_id = _prompt_credential(
             env_name,
             f"Zone ID for {label}\n"
@@ -1462,6 +1479,15 @@ def get_cf_zone_ids(
         )
         if zone_id:
             zone_ids[r2_prefix] = zone_id
+            manual_entered.append(r2_prefix)
+
+    if auto_found or manual_entered:
+        parts = []
+        if auto_found:
+            parts.append(f"auto-discovered: {', '.join(auto_found)}")
+        if manual_entered:
+            parts.append(f"manual: {', '.join(manual_entered)}")
+        print(f"  Zone IDs — {'; '.join(parts)}")
 
     if not zone_ids:
         legacy_zone_id = _prompt_credential(
@@ -1523,10 +1549,21 @@ def run_deploy(analysis: JournalAnalysis) -> bool:
         if env_name not in _cf_credentials:
             _cf_credentials[env_name] = zid
 
+    # Auto-discover any missing zone IDs
+    for _, r2_prefix, _ in folder_map:
+        env_name = f"CF_ZONE_ID_{r2_prefix.upper().replace('-', '_')}"
+        if env_name not in _cf_credentials:
+            domain = urlparse(prefix_origin.get(r2_prefix, "")).hostname
+            if domain and api_token:
+                resp = cf_api("GET", f"/zones?name={domain}", api_token)
+                result = (resp or {}).get("result", [])
+                if result:
+                    _cf_credentials[env_name] = result[0]["id"]
+
     # Pick custom_domain — prefer copernicus.org, fallback to constructed default
     custom_domain = urlparse(prefix_origin.get("articles", f"https://{sc}.copernicus.org")).hostname or f"{sc}.copernicus.org"
 
-    zone_ids = get_cf_zone_ids(folder_map, prefix_origin)
+    zone_ids = get_cf_zone_ids(folder_map, prefix_origin, api_token=api_token)
     save_zone_ids(OUTPUT_DIR, zone_ids)
 
     index_js_path      = OUTPUT_DIR / "index.js"
@@ -2853,7 +2890,13 @@ def run_menu(shortcut: str) -> None:
                     env_name = f"CF_ZONE_ID_{r2_prefix.upper().replace('-', '_')}"
                     _cf_credentials.pop(env_name, None)
                 _cf_credentials.pop("CF_ZONE_ID", None)
-                new_zone_ids = get_cf_zone_ids(folder_map, prefix_origin)
+                # Get credentials for API call
+                cf_env = get_cf_account()
+                if cf_env:
+                    _, api_token_z = cf_env
+                else:
+                    api_token_z = ""
+                new_zone_ids = get_cf_zone_ids(folder_map, prefix_origin, api_token=api_token_z)
                 if new_zone_ids:
                     save_zone_ids(OUTPUT_DIR, new_zone_ids)
                     # Re-populate cache
